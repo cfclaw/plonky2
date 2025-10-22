@@ -12,11 +12,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["gate_testing", "parallel", "rand_chacha", "std", "timing"]
+default = ["gate_testing", "parallel", "rand_chacha", "std", "timing", "serialize_bytemuck", "std", "tsrs", "serialize_rkyv", "serialize_speedy"]
 gate_testing = []
 parallel = ["hashbrown/rayon", "plonky2_maybe_rayon/parallel"]
 std = ["anyhow/std", "rand/std", "itertools/use_std"]
 timing = ["std", "dep:web-time"]
+serialize_rkyv = ["dep:rkyv", "plonky2_field/serialize_rkyv"]
+serialize_speedy = ["dep:speedy", "std", "plonky2_field/serialize_speedy"]
+serialize_bytemuck = ["dep:bytemuck", "plonky2_field/serialize_bytemuck"]
+tsrs = ["dep:ts-rs", "plonky2_field/tsrs"]
 
 [dependencies]
 ahash = { workspace = true }
@@ -32,6 +36,12 @@ serde = { workspace = true, features = ["rc"] }
 static_assertions = { workspace = true }
 unroll = { workspace = true }
 web-time = { version = "1.0.0", optional = true }
+
+# Serialization Helpers
+rkyv = { workspace = true, optional = true }
+speedy = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+ts-rs = { workspace = true, optional = true }
 
 # Local dependencies
 plonky2_field = { version = "1.0.0", path = "../field", default-features = false }

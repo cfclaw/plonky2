@@ -21,8 +21,35 @@ const EPSILON: u64 = (1 << 32) - 1;
 ///   = 2**32 * (2**32 - 1) + 1
 /// ```
 #[derive(Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
 #[repr(transparent)]
 pub struct GoldilocksField(pub u64);
+impl ts_rs::TS for GoldilocksField {
+    type WithoutGenerics = GoldilocksField;
+    
+    fn ident() -> String {
+        "bigint".to_string()
+    }
+
+    fn name() -> String {
+        "bigint".to_string()
+    }
+    fn inline() -> String {
+        "bigint".to_string()
+    }
+    fn inline_flattened() -> String {
+        panic!("{} cannot be flattened", Self::name())
+    }
+    fn decl() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+    fn decl_concrete() -> String {
+        panic!("{} cannot be declared", Self::name())
+    }
+}
+
 
 impl Default for GoldilocksField {
     fn default() -> Self {

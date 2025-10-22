@@ -10,6 +10,14 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["serialize_bytemuck", "std", "tsrs", "serialize_rkyv", "serialize_speedy"]
+std = []
+serialize_rkyv = ["dep:rkyv"]
+serialize_speedy = ["dep:speedy", "std"]
+serialize_bytemuck = ["dep:bytemuck"]
+tsrs = ["dep:ts-rs"]
+
 [dependencies]
 anyhow = { workspace = true }
 itertools = { workspace = true, features = ["use_alloc"] }
@@ -21,6 +29,13 @@ unroll = { workspace = true }
 
 # Local dependencies
 plonky2_util = { version = "1.0.0", path = "../util", default-features = false }
+
+ts-rs = {workspace = true, optional = true}
+
+# Serialization Helpers
+rkyv = { workspace = true, optional = true }
+speedy = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
 
 
 # Display math equations properly in documentation
