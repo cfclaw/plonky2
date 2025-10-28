@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 
 use plonky2_field::extension::Extendable;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::fri::reduction_strategies::FriReductionStrategy;
 use crate::hash::hash_types::RichField;
@@ -27,7 +27,7 @@ pub mod verifier;
 pub mod witness_util;
 
 /// A configuration for the FRI protocol.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FriConfig {
     /// `rate = 2^{-rate_bits}`.
     pub rate_bits: usize,

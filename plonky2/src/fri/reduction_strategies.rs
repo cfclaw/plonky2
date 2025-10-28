@@ -2,14 +2,14 @@
 use alloc::{vec, vec::Vec};
 
 use log::debug;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 #[cfg(feature = "timing")]
 use web_time::Instant;
 
 use crate::hash::hash_types::RichField;
 
 /// A method for deciding what arity to use at each reduction layer.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FriReductionStrategy {
     /// Specifies the exact sequence of arities (expressed in bits) to use.
     Fixed(Vec<usize>),
