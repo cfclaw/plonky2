@@ -11,7 +11,7 @@ use plonky2_maybe_rayon::*;
 
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
-use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
+use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::PolynomialBatch;
@@ -25,7 +25,7 @@ use crate::iop::target::Target;
 use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
-use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::config::{GenericConfig, Hasher, ProverCompute};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{eval_vanishing_poly_base_batch, get_lut_poly};
@@ -180,7 +180,7 @@ where
             config.fri_config.cap_height,
             timing,
             prover_data.fft_root_table.as_ref(),
-        )
+        )?
     );
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
@@ -250,17 +250,17 @@ where
             config.fri_config.cap_height,
             timing,
             prover_data.fft_root_table.as_ref(),
-        )
+        )?
     );
 
     challenger.observe_cap::<C::Hasher>(&partial_products_zs_and_lookup_commitment.merkle_tree.cap);
 
     let alphas = challenger.get_n_challenges(num_challenges);
 
-    let quotient_polys = timed!(
+    let pre_transposed_quotient_polys = timed!(
         timing,
         "compute quotient polys",
-        compute_quotient_polys::<F, C, D>(
+        compute_quotient_polys_pre_transpose::<F, C, D>(
             common_data,
             prover_data,
             &public_inputs_hash,
@@ -273,32 +273,19 @@ where
         )
     );
 
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "split up quotient polys",
-        quotient_polys
-            .into_par_iter()
-            .flat_map(|mut quotient_poly| {
-                quotient_poly.trim_to_len(quotient_degree).expect(
-                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
-            })
-            .collect()
-    );
-
     let quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            all_quotient_poly_chunks,
+        C::Compute::transpose_and_compute_from_coeffs(
+            timing,
+            pre_transposed_quotient_polys,
+            quotient_degree,
+            degree,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
-            timing,
             prover_data.fft_root_table.as_ref(),
-        )
+        )?
     );
 
     challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
@@ -607,7 +594,7 @@ fn compute_all_lookup_polys<
 const BATCH_SIZE: usize = 32;
 
 
-fn compute_quotient_polys<
+fn compute_quotient_polys_pre_transpose<
     'a,
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -622,7 +609,7 @@ fn compute_quotient_polys<
     gammas: &[F],
     deltas: &[F],
     alphas: &[F],
-) -> Vec<PolynomialCoeffs<F>> {
+) -> Vec<Vec<F>> {
     let num_challenges = common_data.config.num_challenges;
     let has_lookup = common_data.num_lookup_polys != 0;
     let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
@@ -751,10 +738,5 @@ fn compute_quotient_polys<
             quotient_values_batch
         })
         .collect();
-
-    transpose(&quotient_values)
-        .into_par_iter()
-        .map(PolynomialValues::new)
-        .map(|values| values.coset_ifft(F::coset_shift()))
-        .collect()
+    quotient_values
 }

@@ -90,7 +90,7 @@ where
             cap_height,
             timing,
             None,
-        )
+        )?
     );
 
     let trace_cap = trace_commitment.merkle_tree.cap.clone();
@@ -214,20 +214,22 @@ where
     );
 
     // Get the polynomial commitments for all auxiliary polynomials.
-    let auxiliary_polys_commitment = auxiliary_polys.map(|aux_polys| {
+    let auxiliary_polys_commitment = if let Some(aux_polys) = auxiliary_polys {
         timed!(
             timing,
             "compute auxiliary polynomials commitment",
-            PolynomialBatch::from_values(
+            anyhow::Ok(Some(PolynomialBatch::from_values(
                 aux_polys,
                 rate_bits,
                 false,
                 config.fri_config.cap_height,
                 timing,
                 None,
-            )
+            )?))
         )
-    });
+    } else {
+        Ok(None)
+    }?;
 
     let auxiliary_polys_cap = auxiliary_polys_commitment
         .as_ref()
@@ -415,7 +417,7 @@ where
                 config.fri_config.cap_height,
                 timing,
                 None,
-            )
+            )?
         );
         // Observe the quotient polynomials Merkle cap.
         let quotient_polys_cap = quotient_commitment.merkle_tree.cap.clone();

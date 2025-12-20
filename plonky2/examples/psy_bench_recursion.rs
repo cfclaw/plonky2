@@ -312,9 +312,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         builder.connect(is_one_non_zero.target, one);
         builder.register_public_inputs(&dummy_public_inputs.elements);
         builder.add_qed_type_c_common_gates();
+        pad_circuit_degree(&mut builder, 12);
+
 
 
         let circuit_data = builder.build::<C>();
+        println!("common_data: {:?}", circuit_data.common);
         DummyPsyTypeCCircuit {
             dummy_public_inputs,
             circuit_data,
@@ -390,7 +393,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         builder.register_public_inputs(&public_inputs_output.elements);
 
         builder.add_qed_type_c_common_gates();
-
         let circuit_data = builder.build::<C>();
         DummyPsyTypeCRecursiveVerifierCircuit {
             proof_a_target,
@@ -470,9 +472,12 @@ fn run_psy_bench_recursion() -> Result<()>{
     );
     let dummy_proof_1 = dummy_inner.prove(HashOut::rand())?;
     let dummy_proof_2 = dummy_inner.prove(HashOut::rand())?;
+
+    let mut start_time =std::time::Instant::now();
     let recursive_proof = dummy_recursive
         .prove(&dummy_proof_1, &dummy_proof_2, dummy_inner.get_verifier_data())?;
 
+    println!("Recursive proof time: {:?}", start_time.elapsed());
     dummy_inner.circuit_data.verify(dummy_proof_1.clone())?;
     dummy_inner.circuit_data.verify(dummy_proof_2.clone())?;
     dummy_recursive.circuit_data.verify(recursive_proof.clone())?;

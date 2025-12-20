@@ -1196,8 +1196,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 Some(&fft_root_table),
             )
         } else {
-            PolynomialBatch::<F, C, D>::default()
-        };
+            Ok(PolynomialBatch::<F, C, D>::default())
+        }.unwrap(); // todo: handle error
 
         // Map between gates where not all generators are used and the gate's number of used generators.
         let incomplete_gates = self

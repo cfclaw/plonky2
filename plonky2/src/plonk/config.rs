@@ -10,7 +10,9 @@
 use alloc::{vec, vec::Vec};
 use core::fmt::Debug;
 
+use plonky2_field::polynomial::PolynomialValues;
 use plonky2_maybe_rayon::*;
+use plonky2_util::log2_strict;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -19,6 +21,7 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::FftRootTable;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::PolynomialCoeffs;
+use crate::fri::oracle::PolynomialBatch;
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::keccak::KeccakHash;
@@ -26,6 +29,8 @@ use crate::hash::merkle_tree::MerkleTree;
 use crate::hash::poseidon::PoseidonHash;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
+use crate::timed;
+use crate::util::timing::TimingTree;
 use crate::util::{reverse_index_bits_in_place, transpose};
 
 pub trait GenericHashOut<F: RichField>:
@@ -38,7 +43,9 @@ pub trait GenericHashOut<F: RichField>:
 }
 
 /// Trait for hash functions.
-pub trait Hasher<F: RichField>: 'static + Sized + Copy + Debug + Eq + PartialEq + Send + Sync {
+pub trait Hasher<F: RichField>:
+    'static + Sized + Copy + Debug + Eq + PartialEq + Send + Sync
+{
     /// Size of `Hash` in bytes.
     const HASH_SIZE: usize;
 
@@ -98,35 +105,62 @@ pub trait AlgebraicHasher<F: RichField>: 'static + Hasher<F, Hash = HashOut<F>> 
 
 /// Trait to abstract heavy prover computations (FFT + Merkle Hashing).
 /// An external crate can implement this to provide GPU acceleration.
-pub trait ProverCompute<F: RichField, H: Hasher<F>>:
+pub trait ProverCompute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>:
     'static + Debug + Clone + Send + Sync
 {
+    /// Takes polynomial coefficients, performs ifft, then performs LDE (FFT), and commits to the Merkle tree.
+
+    fn transpose_and_compute_from_coeffs(
+        timing: &mut TimingTree,
+        pre_transposed_quotient_polys: Vec<Vec<F>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>>;
+
+    fn compute_from_values(
+        timing: &mut TimingTree,
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>>;
+
     /// Takes polynomial coefficients, performs LDE (FFT), and commits to the Merkle tree.
-    fn commit_polynomials(
-        polynomials: &[PolynomialCoeffs<F>],
+    fn compute_from_coeffs(
+        timing: &mut TimingTree,
+        polynomials: Vec<PolynomialCoeffs<F>>,
         cap_height: usize,
         rate_bits: usize,
         blinding: bool,
         fft_root_table: Option<&FftRootTable<F>>,
-    ) -> MerkleTree<F, H>;
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>>;
 }
 
 /// Default CPU implementation of `ProverCompute`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct CpuProverCompute;
-impl<F: RichField, H: Hasher<F>> ProverCompute<F, H> for CpuProverCompute {
-    fn commit_polynomials(
-        polynomials: &[PolynomialCoeffs<F>],
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    ProverCompute<F, C, D> for CpuProverCompute
+{
+    fn compute_from_coeffs(
+        _timing: &mut TimingTree,
+        polynomials: Vec<PolynomialCoeffs<F>>,
         cap_height: usize,
         rate_bits: usize,
         blinding: bool,
         fft_root_table: Option<&FftRootTable<F>>,
-    ) -> MerkleTree<F, H> {
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
         const SALT_SIZE: usize = 4;
         let salt_size = if blinding { SALT_SIZE } else { 0 };
 
         let degree = polynomials[0].len();
-        
+        let degree_log = log2_strict(degree);
+
         let lde_values: Vec<Vec<F>> = polynomials
             .par_iter()
             .map(|p| {
@@ -144,10 +178,85 @@ impl<F: RichField, H: Hasher<F>> ProverCompute<F, H> for CpuProverCompute {
         let mut leaves = transpose(&lde_values);
         reverse_index_bits_in_place(&mut leaves);
 
-        MerkleTree::new(leaves, cap_height)
+        let merkle_tree = MerkleTree::new(leaves, cap_height);
+        Ok(PolynomialBatch {
+            polynomials,
+            merkle_tree,
+            degree_log,
+            rate_bits,
+            blinding,
+        })
+    }
+
+    fn compute_from_values(
+        timing: &mut TimingTree,
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+        let coeffs = timed!(
+            timing,
+            "IFFT",
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        );
+        Self::compute_from_coeffs(
+            timing,
+            coeffs,
+            cap_height,
+            rate_bits,
+            blinding,
+            fft_root_table,
+        )
+    }
+
+    fn transpose_and_compute_from_coeffs(
+        timing: &mut TimingTree,
+        pre_transposed_quotient_polys: Vec<Vec<F>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+        let quotient_polys: Vec<PolynomialCoeffs<F>> = transpose(&pre_transposed_quotient_polys)
+            .into_par_iter()
+            .map(PolynomialValues::new)
+            .map(|values| values.coset_ifft(F::coset_shift()))
+            .collect::<Vec<_>>();
+
+        let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+            timing,
+            "split up quotient polys",
+            quotient_polys
+                .into_par_iter()
+                .flat_map(|mut quotient_poly| {
+                    quotient_poly.trim_to_len(quotient_degree).expect(
+                        "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                    );
+                    // Split quotient into degree-n chunks.
+                    quotient_poly.chunks(degree)
+                })
+                .collect()
+        );
+        
+        let quotient_polys_commitment = timed!(
+            timing,
+            "commit to quotient polys",
+            Self::compute_from_coeffs(
+                timing,
+                all_quotient_poly_chunks,
+                cap_height,
+                rate_bits,
+                blinding,
+                fft_root_table,
+            )?
+        );
+        Ok(quotient_polys_commitment)
     }
 }
-
 
 /// Generic configuration trait.
 pub trait GenericConfig<const D: usize>:
@@ -162,7 +271,7 @@ pub trait GenericConfig<const D: usize>:
     /// Algebraic hash function used for the challenger and hashing public inputs.
     type InnerHasher: AlgebraicHasher<Self::F>;
     /// The engine used for FFTs and Merkle Trees.
-    type Compute: ProverCompute<Self::F, Self::Hasher>;
+    type Compute: ProverCompute<Self::F, Self, D>;
 }
 
 /// Configuration using Poseidon over the Goldilocks field.

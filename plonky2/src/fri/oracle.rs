@@ -20,7 +20,7 @@ use crate::plonk::config::GenericConfig;
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits};
+use crate::util::reverse_bits;
 use crate::plonk::config::ProverCompute;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
@@ -61,7 +61,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        C::Compute::compute_from_values(
+            timing,
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+        /*
         let coeffs = timed!(
             timing,
             "IFFT",
@@ -75,7 +84,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             cap_height,
             timing,
             fft_root_table,
-        )
+        )*/
     }
 
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
@@ -86,29 +95,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
-    ) -> Self {
-        let degree = polynomials[0].len();
-        let degree_log = log2_strict(degree);
-
-        let merkle_tree = timed!(
+    ) -> anyhow::Result<Self> {
+        C::Compute::compute_from_coeffs(
             timing,
-            "FFT + Merkle Tree (via ProverCompute backend)",
-            C::Compute::commit_polynomials(
-                &polynomials,
-                cap_height,
-                rate_bits,
-                blinding,
-                fft_root_table
-            )
-        );
-
-        Self {
             polynomials,
-            merkle_tree,
-            degree_log,
+            cap_height,
             rate_bits,
             blinding,
-        }
+            fft_root_table,
+        )
     }
 
     /// Fetches LDE values at the `index * step`th point.
