@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use crate::extension::Frobenius;
 use crate::ops::Square;
+use crate::serialization::MaybePsySerialize;
 
 /// Sampling
 pub trait Sample: Sized {
@@ -70,6 +71,7 @@ pub trait Field:
     + Sync
     + Serialize
     + DeserializeOwned
+    + MaybePsySerialize
 {
     const ZERO: Self;
     const ONE: Self;

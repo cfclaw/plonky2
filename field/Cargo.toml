@@ -11,7 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["serialize_bytemuck", "std", "tsrs", "serialize_rkyv", "serialize_speedy"]
+default = []
 std = []
 serialize_rkyv = ["dep:rkyv"]
 serialize_speedy = ["dep:speedy", "std"]

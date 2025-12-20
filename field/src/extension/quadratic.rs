@@ -11,6 +11,10 @@ use crate::types::{Field, Sample};
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(bound = "")]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[repr(transparent)]
 pub struct QuadraticExtension<F: Extendable<2>>(pub [F; 2]);
 
 impl<F: Extendable<2>> Default for QuadraticExtension<F> {

@@ -8,23 +8,29 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
+use plonky2_field::serialization::MaybePsySerialize;
 use core::fmt::Debug;
 
+use plonky2_maybe_rayon::*;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::fft::FftRootTable;
 use crate::field::goldilocks_field::GoldilocksField;
+use crate::field::polynomial::PolynomialCoeffs;
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::keccak::KeccakHash;
+use crate::hash::merkle_tree::MerkleTree;
 use crate::hash::poseidon::PoseidonHash;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
+use crate::util::{reverse_index_bits_in_place, transpose};
 
 pub trait GenericHashOut<F: RichField>:
-    Copy + Clone + Debug + Eq + PartialEq + Send + Sync + Serialize + DeserializeOwned
+    Copy + Clone + Debug + Eq + PartialEq + Send + Sync + Serialize + DeserializeOwned + MaybePsySerialize
 {
     fn to_bytes(&self) -> Vec<u8>;
     fn from_bytes(bytes: &[u8]) -> Self;
@@ -33,7 +39,7 @@ pub trait GenericHashOut<F: RichField>:
 }
 
 /// Trait for hash functions.
-pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
+pub trait Hasher<F: RichField>: 'static + Sized + Copy + Debug + Eq + PartialEq + Send + Sync {
     /// Size of `Hash` in bytes.
     const HASH_SIZE: usize;
 
@@ -77,7 +83,7 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
 }
 
 /// Trait for algebraic hash functions, built from a permutation using the sponge construction.
-pub trait AlgebraicHasher<F: RichField>: Hasher<F, Hash = HashOut<F>> {
+pub trait AlgebraicHasher<F: RichField>: 'static + Hasher<F, Hash = HashOut<F>> {
     type AlgebraicPermutation: PlonkyPermutation<Target>;
 
     /// Circuit to conditionally swap two chunks of the inputs (useful in verifying Merkle proofs),
@@ -91,9 +97,62 @@ pub trait AlgebraicHasher<F: RichField>: Hasher<F, Hash = HashOut<F>> {
         F: RichField + Extendable<D>;
 }
 
+/// Trait to abstract heavy prover computations (FFT + Merkle Hashing).
+/// An external crate can implement this to provide GPU acceleration.
+pub trait ProverCompute<F: RichField, H: Hasher<F>>:
+    'static + Debug + Clone + Send + Sync
+{
+    /// Takes polynomial coefficients, performs LDE (FFT), and commits to the Merkle tree.
+    fn commit_polynomials(
+        polynomials: &[PolynomialCoeffs<F>],
+        cap_height: usize,
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> MerkleTree<F, H>;
+}
+
+/// Default CPU implementation of `ProverCompute`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CpuProverCompute;
+impl<F: RichField, H: Hasher<F>> ProverCompute<F, H> for CpuProverCompute {
+    fn commit_polynomials(
+        polynomials: &[PolynomialCoeffs<F>],
+        cap_height: usize,
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> MerkleTree<F, H> {
+        const SALT_SIZE: usize = 4;
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+
+        let degree = polynomials[0].len();
+        
+        let lde_values: Vec<Vec<F>> = polynomials
+            .par_iter()
+            .map(|p| {
+                p.lde(rate_bits)
+                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                    .values
+            })
+            .chain(
+                (0..salt_size)
+                    .into_par_iter()
+                    .map(|_| F::rand_vec(degree << rate_bits)),
+            )
+            .collect();
+
+        let mut leaves = transpose(&lde_values);
+        reverse_index_bits_in_place(&mut leaves);
+
+        MerkleTree::new(leaves, cap_height)
+    }
+}
+
+
 /// Generic configuration trait.
 pub trait GenericConfig<const D: usize>:
-    Debug + Clone + Sync + Sized + Send + Eq + PartialEq
+    'static + Debug + Clone + Sync + Sized + Send + Eq + PartialEq
 {
     /// Main field.
     type F: RichField + Extendable<D, Extension = Self::FE>;
@@ -103,6 +162,8 @@ pub trait GenericConfig<const D: usize>:
     type Hasher: Hasher<Self::F>;
     /// Algebraic hash function used for the challenger and hashing public inputs.
     type InnerHasher: AlgebraicHasher<Self::F>;
+    /// The engine used for FFTs and Merkle Trees.
+    type Compute: ProverCompute<Self::F, Self::Hasher>;
 }
 
 /// Configuration using Poseidon over the Goldilocks field.
@@ -113,6 +174,7 @@ impl GenericConfig<2> for PoseidonGoldilocksConfig {
     type FE = QuadraticExtension<Self::F>;
     type Hasher = PoseidonHash;
     type InnerHasher = PoseidonHash;
+    type Compute = CpuProverCompute;
 }
 
 /// Configuration using truncated Keccak over the Goldilocks field.
@@ -123,4 +185,5 @@ impl GenericConfig<2> for KeccakGoldilocksConfig {
     type FE = QuadraticExtension<Self::F>;
     type Hasher = KeccakHash<25>;
     type InnerHasher = PoseidonHash;
+    type Compute = CpuProverCompute;
 }

@@ -1,0 +1,53 @@
+[package]
+name = "plonky2_poseidon2"
+description = "Implementation of Poseidon2 for Plonky2"
+version = "1.1.0"
+authors = ["Carter Feldman"]
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["parallel", "std", "timing"]
+parallel = ["plonky2/parallel", "plonky2_maybe_rayon/parallel"]
+std = ["anyhow/std", "plonky2/std"]
+timing = ["plonky2/timing"]
+
+[dependencies]
+ahash = { workspace = true }
+anyhow = { workspace = true }
+hashbrown = { workspace = true }
+itertools = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
+num-bigint = { version = "0.4.3", default-features = false }
+unroll = { workspace = true }
+
+# Local dependencies
+plonky2 = { version = "1.1.0", path = "../plonky2", default-features = false }
+plonky2_field = { path = "../field", default-features = false }
+plonky2_maybe_rayon = { version = "1.0.0", path = "../maybe_rayon", default-features = false }
+plonky2_util = { version = "1.0.0", path = "../util", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false }
+env_logger = { version = "0.9.0", default-features = false }
+num_cpus = { version = "1.14.0", default-features = false }
+rand = { workspace = true, features = ["getrandom"] }
+rand_chacha = { version = "0.3.1", default-features = false }
+serde_cbor = { version = "0.11.2" }
+serde_json = { version = "1.0" }
+structopt = { version = "0.3.26", default-features = false }
+tynm = { version = "0.1.6", default-features = false }
+plonky2 = { version = "1.1.0", path = "../plonky2", features = ["gate_testing"] }
+
+# Display math equations properly in documentation
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", ".cargo/katex-header.html"]
+
+[lints]
+workspace = true

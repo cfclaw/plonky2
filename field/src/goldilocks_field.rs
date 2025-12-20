@@ -26,6 +26,7 @@ const EPSILON: u64 = (1 << 32) - 1;
 #[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
 #[repr(transparent)]
 pub struct GoldilocksField(pub u64);
+#[cfg(feature = "tsrs")]
 impl ts_rs::TS for GoldilocksField {
     type WithoutGenerics = GoldilocksField;
     

@@ -20,6 +20,10 @@ use crate::types::{Field, PrimeField, Sample};
 ///   = 2**256 - 432420386565659656852420866394968145599
 /// ```
 #[derive(Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[repr(transparent)]
 pub struct Secp256K1Scalar(pub [u64; 4]);
 
 fn biguint_from_array(arr: [u64; 4]) -> BigUint {
