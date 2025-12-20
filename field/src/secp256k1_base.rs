@@ -1,4 +1,7 @@
 use alloc::vec::Vec;
+#[cfg(all(not(feature = "std"), feature = "ts-rs"))]
+use alloc::string::{String, ToString};
+
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::{Hash, Hasher};
 use core::iter::{Product, Sum};
@@ -24,6 +27,26 @@ use crate::types::{Field, PrimeField, Sample};
 #[repr(transparent)]
 pub struct Secp256K1Base(pub [u64; 4]);
 
+#[cfg(feature = "ts-rs")]
+impl ts_rs::TS for Secp256K1Base {
+    type WithoutGenerics = Secp256K1Base;
+
+    fn name() -> String {
+        "Secp256K1Base".to_string()
+    }
+    fn inline() -> String {
+        "[bigint, bigint, bigint, bigint]".to_string()
+    }
+    fn inline_flattened() -> String {
+        "[bigint, bigint, bigint, bigint]".to_string()
+    }
+    fn decl() -> String {
+        "export type Secp256K1Base = [bigint, bigint, bigint, [bigint];".to_string()
+    }
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
+}
 fn biguint_from_array(arr: [u64; 4]) -> BigUint {
     BigUint::from_slice(&[
         arr[0] as u32,

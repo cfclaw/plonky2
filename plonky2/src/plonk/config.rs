@@ -8,7 +8,6 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
-use plonky2_field::serialization::MaybePsySerialize;
 use core::fmt::Debug;
 
 use plonky2_maybe_rayon::*;
@@ -30,7 +29,7 @@ use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::util::{reverse_index_bits_in_place, transpose};
 
 pub trait GenericHashOut<F: RichField>:
-    Copy + Clone + Debug + Eq + PartialEq + Send + Sync + Serialize + DeserializeOwned + MaybePsySerialize
+    Copy + Clone + Debug + Eq + PartialEq + Send + Sync + Serialize + DeserializeOwned
 {
     fn to_bytes(&self) -> Vec<u8>;
     fn from_bytes(bytes: &[u8]) -> Self;

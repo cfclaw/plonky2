@@ -1,3 +1,7 @@
+
+#[cfg(all(not(feature = "std"), feature = "ts-rs"))]
+use alloc::string::{String, ToString};
+
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::{Hash, Hasher};
 use core::iter::{Product, Sum};
@@ -26,7 +30,8 @@ const EPSILON: u64 = (1 << 32) - 1;
 #[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
 #[repr(transparent)]
 pub struct GoldilocksField(pub u64);
-#[cfg(feature = "tsrs")]
+
+#[cfg(feature = "ts-rs")]
 impl ts_rs::TS for GoldilocksField {
     type WithoutGenerics = GoldilocksField;
     

@@ -2,22 +2,50 @@
 #[cfg(feature = "serialize_speedy")]
 mod speedy_impls {
     use plonky2_field::extension::Extendable;
-    use plonky2_field::polynomial::PolynomialCoeffs;
     use speedy::{Context, Readable, Reader, Writable, Writer};
 
-    use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
+    use crate::fri::proof::{FriProof, FriQueryRound, FriQueryStep};
     use crate::hash::hash_types::{BytesHash, RichField};
-    use crate::hash::merkle_tree::MerkleCap;
     use crate::plonk::circuit_data::VerifierOnlyCircuitData;
     use crate::plonk::config::{GenericConfig, Hasher};
     use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
+impl<'a, C: Context, F, H, const D: usize> Readable<'a, C> for FriQueryStep<F, H, D>
+where
+    F: RichField + Extendable<D> + Readable<'a, C>,
+    H: Hasher<F>,
+    H::Hash: Readable<'a, C>,
+    F::Extension: Readable<'a, C>, // Ensure the extension field is readable
+{
+    #[inline]
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        let evals = reader.read_value()?;
+        let merkle_proof = reader.read_value()?;
+        Ok(FriQueryStep { evals, merkle_proof })
+    }
+}
 
+impl<C: Context, F, H, const D: usize> Writable<C> for FriQueryStep<F, H, D>
+where
+    F: RichField + Extendable<D>,
+    H: Hasher<F>,
+    H::Hash: Writable<C>,
+    F::Extension: Writable<C>, // Ensure the extension field is writable
+    F: Writable<C>,
+{
+    #[inline]
+    fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
+        writer.write_value(&self.evals)?;
+        writer.write_value(&self.merkle_proof)?;
+        Ok(())
+    }
+}
     // --- FriQueryRound ---
     impl<'a, C: Context, F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> Readable<'a, C>
         for FriQueryRound<F, H, D>
     where
-        FriInitialTreeProof<F, H>: Readable<'a, C>,
-        FriQueryStep<F, H, D>: Readable<'a, C>,
+        F: Readable<'a, C>,
+        F::Extension: Readable<'a, C>,
+        H::Hash: Readable<'a, C>,
     {
         #[inline]
         fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
@@ -30,9 +58,10 @@ mod speedy_impls {
 
     impl<C: Context, F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> Writable<C>
         for FriQueryRound<F, H, D>
-    where
-        FriInitialTreeProof<F, H>: Writable<C>,
-        FriQueryStep<F, H, D>: Writable<C>,
+    where 
+        F::Extension: Writable<C>,
+        F: Writable<C>,
+        H::Hash: Writable<C>,
     {
         #[inline]
         fn write_to<T: ?Sized + Writer<C>>(&self, writer: &mut T) -> Result<(), C::Error> {
@@ -46,10 +75,9 @@ mod speedy_impls {
     impl<'a, C: Context, F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> Readable<'a, C>
         for FriProof<F, H, D>
     where
-        MerkleCap<F, H>: Readable<'a, C>,
-        FriQueryRound<F, H, D>: Readable<'a, C>,
-        PolynomialCoeffs<F::Extension>: Readable<'a, C>,
         F: Readable<'a, C>,
+        F::Extension: Readable<'a, C>,
+        H::Hash: Readable<'a, C>,
     {
         #[inline]
         fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
@@ -65,9 +93,8 @@ mod speedy_impls {
     impl<C: Context, F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> Writable<C>
         for FriProof<F, H, D>
     where
-        MerkleCap<F, H>: Writable<C>,
-        FriQueryRound<F, H, D>: Writable<C>,
-        PolynomialCoeffs<F::Extension>: Writable<C>,
+        H::Hash: Writable<C>,
+        F::Extension: Writable<C>,
         F: Writable<C>,
     {
         #[inline]
@@ -147,10 +174,10 @@ mod speedy_impls {
             C: GenericConfig<D, F = F>,
             const D: usize,
         > Readable<'a, Ctx> for Proof<F, C, D>
-    where
-        MerkleCap<F, C::Hasher>: Readable<'a, Ctx>,
-        OpeningSet<F, D>: Readable<'a, Ctx>,
-        FriProof<F, C::Hasher, D>: Readable<'a, Ctx>,
+    where 
+        F: Readable<'a, Ctx>,
+        F::Extension: Readable<'a, Ctx>,
+        <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash: Readable<'a, Ctx>,
     {
         #[inline]
         fn read_from<R: Reader<'a, Ctx>>(reader: &mut R) -> Result<Self, Ctx::Error> {
@@ -171,9 +198,9 @@ mod speedy_impls {
             const D: usize,
         > Writable<Ctx> for Proof<F, C, D>
     where
-        MerkleCap<F, C::Hasher>: Writable<Ctx>,
-        OpeningSet<F, D>: Writable<Ctx>,
-        FriProof<F, C::Hasher, D>: Writable<Ctx>,
+        F: Writable<Ctx>,
+        F::Extension: Writable<Ctx>,
+        <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash: Writable<Ctx>,
     {
         #[inline]
         fn write_to<T: ?Sized + Writer<Ctx>>(&self, writer: &mut T) -> Result<(), Ctx::Error> {
@@ -194,8 +221,9 @@ mod speedy_impls {
             const D: usize,
         > Readable<'a, Ctx> for ProofWithPublicInputs<F, C, D>
     where
-        Proof<F, C, D>: Readable<'a, Ctx>,
         F: Readable<'a, Ctx>,
+        F::Extension: Readable<'a, Ctx>,
+        <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash: Readable<'a, Ctx>,
     {
         #[inline]
         fn read_from<R: Reader<'a, Ctx>>(reader: &mut R) -> Result<Self, Ctx::Error> {
@@ -212,8 +240,9 @@ mod speedy_impls {
             const D: usize,
         > Writable<Ctx> for ProofWithPublicInputs<F, C, D>
     where
-        Proof<F, C, D>: Writable<Ctx>,
         F: Writable<Ctx>,
+        F::Extension: Writable<Ctx>,
+        <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash: Writable<Ctx>,
     {
         #[inline]
         fn write_to<T: ?Sized + Writer<Ctx>>(&self, writer: &mut T) -> Result<(), Ctx::Error> {
@@ -226,7 +255,6 @@ mod speedy_impls {
     impl<'a, Ctx: Context, C: GenericConfig<D>, const D: usize> Readable<'a, Ctx>
         for VerifierOnlyCircuitData<C, D>
     where
-        MerkleCap<C::F, C::Hasher>: Readable<'a, Ctx>,
         <<C as GenericConfig<D>>::Hasher as Hasher<C::F>>::Hash: Readable<'a, Ctx>,
     {
         #[inline]
@@ -242,7 +270,6 @@ mod speedy_impls {
     impl<Ctx: Context, C: GenericConfig<D>, const D: usize> Writable<Ctx>
         for VerifierOnlyCircuitData<C, D>
     where
-        MerkleCap<C::F, C::Hasher>: Writable<Ctx>,
         <<C as GenericConfig<D>>::Hasher as Hasher<C::F>>::Hash: Writable<Ctx>,
     {
         #[inline]

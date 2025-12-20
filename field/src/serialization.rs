@@ -32,5 +32,14 @@ pub trait MaybeBytemuck {}
 #[cfg(not(all(feature="serialize_bytemuck", target_endian = "little")))]
 impl<T> MaybeBytemuck for T {}
 
+#[cfg(feature = "ts-rs")]
+pub trait MaybeTSRS: ts_rs::TS {}
+#[cfg(feature = "ts-rs")]
+impl<T: ts_rs::TS> MaybeTSRS for T {}
+#[cfg(not(feature = "ts-rs"))]
+pub trait MaybeTSRS {}
+#[cfg(not(feature = "ts-rs"))]
+impl<T> MaybeTSRS for T {}
+
 pub trait MaybePsySerialize: MaybeSpeedy + MaybeBytemuck {}
 impl<T: MaybeSpeedy + MaybeBytemuck> MaybePsySerialize for T {}

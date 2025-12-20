@@ -1,6 +1,5 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
-use plonky2_field::serialization::MaybePsySerialize;
 use core::fmt;
 
 use anyhow::ensure;
@@ -14,7 +13,7 @@ use crate::iop::target::Target;
 use crate::plonk::config::GenericHashOut;
 
 /// A prime order field with the features we need to use it as a base field in our argument system.
-pub trait RichField: PrimeField64 + Poseidon + MaybePsySerialize {}
+pub trait RichField: PrimeField64 + Poseidon {}
 
 impl RichField for GoldilocksField {}
 
@@ -32,7 +31,7 @@ pub struct HashOut<F: Field> {
 }
 
 
-#[cfg(feature = "tsrs")]
+#[cfg(feature = "ts-rs")]
 impl<F: Field> ts_rs::TS for HashOut<F> {
     type WithoutGenerics = HashOut<GoldilocksField>;
 
