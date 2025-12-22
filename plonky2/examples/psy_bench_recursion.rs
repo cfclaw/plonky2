@@ -473,7 +473,7 @@ fn run_psy_bench_recursion() -> Result<()>{
     let dummy_proof_1 = dummy_inner.prove(HashOut::rand())?;
     let dummy_proof_2 = dummy_inner.prove(HashOut::rand())?;
 
-    let mut start_time =std::time::Instant::now();
+    let start_time =std::time::Instant::now();
     let recursive_proof = dummy_recursive
         .prove(&dummy_proof_1, &dummy_proof_2, dummy_inner.get_verifier_data())?;
 
