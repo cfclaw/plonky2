@@ -161,7 +161,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         blinding: bool,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        println!("CPU ProverCompute::compute_from_coeffs called");
+        //println!("CPU ProverCompute::compute_from_coeffs called");
         const SALT_SIZE: usize = 4;
         let salt_size = if blinding { SALT_SIZE } else { 0 };
 
@@ -211,7 +211,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        println!("CPU ProverCompute::compute_from_values called");
+        //println!("CPU ProverCompute::compute_from_values called");
         let coeffs = timed!(
             timing,
             "IFFT",
@@ -237,7 +237,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        println!("CPU ProverCompute::transpose_and_compute_from_coeffs called");
+        //println!("CPU ProverCompute::transpose_and_compute_from_coeffs called");
         let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
             timing,
             "coset IFFT quotient polys",
@@ -283,7 +283,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         leaves: Vec<Vec<F>>,
         cap_height: usize,
     ) -> anyhow::Result<MerkleTree<F, C::Hasher>> {
-        println!("CPU ProverCompute::build_merkle_tree called");
+        //println!("CPU ProverCompute::build_merkle_tree called");
         let merkle_tree = timed!(timing, "Merkle tree", MerkleTree::new(leaves, cap_height));
         Ok(merkle_tree)
     }
