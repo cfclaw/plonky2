@@ -20,6 +20,9 @@ use crate::types::Field;
 /// The points are implicitly `g^i`, where `g` generates the subgroup whose size equals the number
 /// of points.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[repr(transparent)]
 pub struct PolynomialValues<F: Field> {
     pub values: Vec<F>,
 }
@@ -113,6 +116,9 @@ impl<F: Field> From<Vec<F>> for PolynomialValues<F> {
 /// A polynomial in coefficient form.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[repr(transparent)]
 pub struct PolynomialCoeffs<F: Field> {
     pub coeffs: Vec<F>,
 }

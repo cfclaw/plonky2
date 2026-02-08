@@ -11,12 +11,12 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["serialize_bytemuck", "std", "tsrs", "serialize_rkyv", "serialize_speedy"]
+default = ["ts-rs"]
 std = []
 serialize_rkyv = ["dep:rkyv"]
 serialize_speedy = ["dep:speedy", "std"]
 serialize_bytemuck = ["dep:bytemuck"]
-tsrs = ["dep:ts-rs"]
+ts-rs = ["dep:ts-rs"]
 
 [dependencies]
 anyhow = { workspace = true }

@@ -4,7 +4,10 @@ use crate::packed::PackedField;
 use crate::types::Field;
 
 /// Precomputations of the evaluation of `Z_H(X) = X^n - 1` on a coset `gK` with `H <= K`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[repr(C)]
 pub struct ZeroPolyOnCoset<F: Field> {
     /// `n = |H|`.
     n: F,

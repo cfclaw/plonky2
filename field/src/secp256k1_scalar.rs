@@ -4,6 +4,9 @@ use core::hash::{Hash, Hasher};
 use core::iter::{Product, Sum};
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
+#[cfg(all(not(feature = "std"), feature = "ts-rs"))]
+use alloc::string::{String, ToString};
+
 use itertools::Itertools;
 use num::bigint::BigUint;
 use num::{Integer, One};
@@ -20,6 +23,10 @@ use crate::types::{Field, PrimeField, Sample};
 ///   = 2**256 - 432420386565659656852420866394968145599
 /// ```
 #[derive(Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "serialize_rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[cfg_attr(feature = "serialize_bytemuck", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[repr(transparent)]
 pub struct Secp256K1Scalar(pub [u64; 4]);
 
 fn biguint_from_array(arr: [u64; 4]) -> BigUint {
@@ -33,6 +40,26 @@ fn biguint_from_array(arr: [u64; 4]) -> BigUint {
         arr[3] as u32,
         (arr[3] >> 32) as u32,
     ])
+}
+#[cfg(feature = "ts-rs")]
+impl ts_rs::TS for Secp256K1Scalar {
+    type WithoutGenerics = Secp256K1Scalar;
+
+    fn name() -> String {
+        "Secp256K1Scalar".to_string()
+    }
+    fn inline() -> String {
+        "[bigint, bigint, bigint, bigint]".to_string()
+    }
+    fn inline_flattened() -> String {
+        "[bigint, bigint, bigint, bigint]".to_string()
+    }
+    fn decl() -> String {
+        "export type Secp256K1Scalar = [bigint, bigint, bigint, bigint];".to_string()
+    }
+    fn decl_concrete() -> String {
+        Self::decl()
+    }
 }
 
 impl Default for Secp256K1Scalar {

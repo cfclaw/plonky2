@@ -37,6 +37,8 @@ pub struct FriQueryStepTarget<const D: usize> {
 /// before they are combined into a composition polynomial.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 #[serde(bound = "")]
+#[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
+#[repr(transparent)]
 pub struct FriInitialTreeProof<F: RichField, H: Hasher<F>> {
     pub evals_proofs: Vec<(Vec<F>, MerkleProof<F, H>)>,
 }

@@ -20,8 +20,8 @@ use crate::plonk::config::GenericConfig;
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transpose};
-
+use crate::util::reverse_bits;
+use crate::plonk::config::ProverCompute;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
@@ -61,7 +61,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        C::Compute::compute_from_values(
+            timing,
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        )
+        /*
         let coeffs = timed!(
             timing,
             "IFFT",
@@ -75,7 +84,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             cap_height,
             timing,
             fft_root_table,
-        )
+        )*/
     }
 
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
@@ -86,56 +95,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
-    ) -> Self {
-        let degree = polynomials[0].len();
-        let lde_values = timed!(
+    ) -> anyhow::Result<Self> {
+        C::Compute::compute_from_coeffs(
             timing,
-            "FFT + blinding",
-            Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
-        );
-
-        let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
-        reverse_index_bits_in_place(&mut leaves);
-        let merkle_tree = timed!(
-            timing,
-            "build Merkle tree",
-            MerkleTree::new(leaves, cap_height)
-        );
-
-        Self {
             polynomials,
-            merkle_tree,
-            degree_log: log2_strict(degree),
+            cap_height,
             rate_bits,
             blinding,
-        }
-    }
-
-    pub(crate) fn lde_values(
-        polynomials: &[PolynomialCoeffs<F>],
-        rate_bits: usize,
-        blinding: bool,
-        fft_root_table: Option<&FftRootTable<F>>,
-    ) -> Vec<Vec<F>> {
-        let degree = polynomials[0].len();
-
-        // If blinding, salt with two random elements to each leaf vector.
-        let salt_size = if blinding { SALT_SIZE } else { 0 };
-
-        polynomials
-            .par_iter()
-            .map(|p| {
-                assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                p.lde(rate_bits)
-                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
-                    .values
-            })
-            .chain(
-                (0..salt_size)
-                    .into_par_iter()
-                    .map(|_| F::rand_vec(degree << rate_bits)),
-            )
-            .collect()
+            fft_root_table,
+        )
     }
 
     /// Fetches LDE values at the `index * step`th point.
@@ -156,8 +124,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .map(|i| self.get_lde_values(index_start + i, step))
             .collect_vec();
 
-        // This is essentially a transpose, but we will not use the generic transpose method as we
-        // want inner lists to be of type P, not Vecs which would involve allocation.
         let leaf_size = row_wise[0].len();
         (0..leaf_size)
             .map(|j| {
@@ -186,18 +152,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
 
-        // Final low-degree polynomial that goes into FRI.
         let mut final_poly = PolynomialCoeffs::empty();
 
-        // Each batch `i` consists of an opening point `z_i` and polynomials `{f_ij}_j` to be opened at that point.
-        // For each batch, we compute the composition polynomial `F_i = sum alpha^j f_ij`,
-        // where `alpha` is a random challenge in the extension field.
-        // The final polynomial is then computed as `final_poly = sum_i alpha^(k_i) (F_i(X) - F_i(z_i))/(X-z_i)`
-        // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
-        // There are usually two batches for the openings at `zeta` and `g * zeta`.
-        // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
         for FriBatchInfo { point, polynomials } in &instance.batches {
-            // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
             });
