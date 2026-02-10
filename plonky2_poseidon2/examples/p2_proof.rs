@@ -108,6 +108,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> CircuitBuilderQED
         )));
         // Use Poseidon2Gate, not PoseidonGate — avoids creating an extra selector group
         self.add_gate_to_gate_set(GateRef::new(Poseidon2Gate::<F, D>::new()));
+        // Note: Poseidon2 MDS gates are auto-added by the recursive circuit.
         self.add_gate_to_gate_set(GateRef::new(ReducingGate::<D>::new(43)));
         self.add_gate_to_gate_set(GateRef::new(ReducingExtensionGate::<D>::new(32)));
         self.add_gate_to_gate_set(GateRef::new(ArithmeticGate::new_from_config(&self.config)));
@@ -144,6 +145,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> CircuitBuilderQED
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(Poseidon2Gate::<F, D>::new()));
+        // Note: Poseidon2 MDS gates are auto-added by the recursive circuit.
         self.add_gate_to_gate_set(GateRef::new(ReducingGate::<D>::new(43)));
         self.add_gate_to_gate_set(GateRef::new(ReducingExtensionGate::<D>::new(32)));
         self.add_gate_to_gate_set(GateRef::new(ArithmeticGate::new_from_config(&self.config)));
@@ -169,6 +171,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> CircuitBuilderQED
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(Poseidon2Gate::<F, D>::new()));
+        // Note: Poseidon2 MDS gates are auto-added by the recursive circuit.
         self.add_gate_to_gate_set(GateRef::new(ReducingGate::<D>::new(43)));
         self.add_gate_to_gate_set(GateRef::new(ReducingExtensionGate::<D>::new(32)));
         self.add_gate_to_gate_set(GateRef::new(ArithmeticGate::new_from_config(&self.config)));
@@ -194,6 +197,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> CircuitBuilderQED
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(Poseidon2Gate::<F, D>::new()));
+        // Note: Poseidon2 MDS gates are auto-added by the recursive circuit.
         self.add_gate_to_gate_set(GateRef::new(ReducingGate::<D>::new(43)));
         self.add_gate_to_gate_set(GateRef::new(ReducingExtensionGate::<D>::new(32)));
         self.add_gate_to_gate_set(GateRef::new(ArithmeticGate::new_from_config(&self.config)));
@@ -218,6 +222,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> CircuitBuilderQED
         let coset_gate = GateRef::new(new_coset_gate_with_max_degree::<F, D>(4, 8));
         self.add_gate_to_gate_set(coset_gate);
         self.add_gate_to_gate_set(GateRef::new(Poseidon2Gate::<F, D>::new()));
+        // Note: Poseidon2 MDS gates are auto-added by the recursive circuit.
         self.add_gate_to_gate_set(GateRef::new(ReducingGate::<D>::new(43)));
         self.add_gate_to_gate_set(GateRef::new(ReducingExtensionGate::<D>::new(32)));
         self.add_gate_to_gate_set(GateRef::new(ArithmeticGate::new_from_config(&self.config)));
@@ -243,6 +248,7 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> CircuitBuilderQED
         self.add_gate_to_gate_set(coset_gate);
 
         self.add_gate_to_gate_set(GateRef::new(Poseidon2Gate::<F, D>::new()));
+        // Note: Poseidon2 MDS gates are auto-added by the recursive circuit.
         self.add_gate_to_gate_set(GateRef::new(ReducingGate::<D>::new(43)));
         self.add_gate_to_gate_set(GateRef::new(ReducingExtensionGate::<D>::new(32)));
         self.add_gate_to_gate_set(GateRef::new(ArithmeticGate::new_from_config(&self.config)));

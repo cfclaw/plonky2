@@ -111,6 +111,10 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> CircuitBuilderQED
         // extra selector polynomial, pushing the recursive circuit past 2^13
         // and doubling the proof time.
         self.add_gate_to_gate_set(GateRef::new(Poseidon2Gate::<F, D>::new()));
+        // Note: Poseidon2ExternalLayerGate and Poseidon2InternalLayerGate are NOT
+        // registered here. They are automatically added to the recursive circuit's
+        // gate set when Poseidon2Gate::eval_unfiltered_circuit creates them.
+        // Adding them here would create a 4th selector group in the inner circuit.
 
         self.add_gate_to_gate_set(GateRef::new(ReducingGate::<D>::new(43)));
         self.add_gate_to_gate_set(GateRef::new(ReducingExtensionGate::<D>::new(32)));

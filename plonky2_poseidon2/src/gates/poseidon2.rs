@@ -9,6 +9,7 @@ use core::marker::PhantomData;
 
 use anyhow::Result;
 
+use crate::gates::poseidon_mds::Poseidon2MdsGate;
 use crate::hash::poseidon2::{
     Poseidon2, HALF_N_FULL_ROUNDS, N_PARTIAL_ROUNDS, SPONGE_WIDTH,
 };
@@ -299,6 +300,12 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         builder: &mut CircuitBuilder<F, D>,
         vars: EvaluationTargets<D>,
     ) -> Vec<ExtensionTarget<D>> {
+        // Use MDS gates when we have enough routed wires, reducing builder operations
+        // in recursive circuits. Each MDS gate replaces ~50 arithmetic operations with
+        // a single degree-1 gate row.
+        let use_mds_gate = builder.config.num_routed_wires
+            >= Poseidon2MdsGate::<F, D>::new().num_wires();
+
         let mut constraints = Vec::with_capacity(self.num_constraints());
 
         let swap = vars.local_wires[Self::WIRE_SWAP];
@@ -324,7 +331,11 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             state[i] = vars.local_wires[Self::wire_input(i)];
         }
 
-        <F as Poseidon2>::external_linear_layer_circuit(builder, &mut state);
+        if use_mds_gate {
+            Self::external_layer_via_gate(builder, &mut state);
+        } else {
+            <F as Poseidon2>::external_linear_layer_circuit(builder, &mut state);
+        }
 
         for r in 0..HALF_N_FULL_ROUNDS {
             for i in 0..SPONGE_WIDTH {
@@ -344,7 +355,11 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
                 state[i] = <F as Poseidon2>::sbox_monomial_circuit(builder, state[i]);
             }
 
-            <F as Poseidon2>::external_linear_layer_circuit(builder, &mut state);
+            if use_mds_gate {
+                Self::external_layer_via_gate(builder, &mut state);
+            } else {
+                <F as Poseidon2>::external_linear_layer_circuit(builder, &mut state);
+            }
         }
 
         for r in 0..N_PARTIAL_ROUNDS {
@@ -359,7 +374,11 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
             state[0] = wire;
             state[0] = <F as Poseidon2>::sbox_monomial_circuit(builder, state[0]);
 
-            <F as Poseidon2>::internal_linear_layer_circuit(builder, &mut state);
+            if use_mds_gate {
+                Self::internal_layer_via_gate(builder, &mut state);
+            } else {
+                <F as Poseidon2>::internal_linear_layer_circuit(builder, &mut state);
+            }
         }
 
         for r in 0..HALF_N_FULL_ROUNDS {
@@ -379,7 +398,11 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
                 state[i] = <F as Poseidon2>::sbox_monomial_circuit(builder, state[i]);
             }
 
-            <F as Poseidon2>::external_linear_layer_circuit(builder, &mut state);
+            if use_mds_gate {
+                Self::external_layer_via_gate(builder, &mut state);
+            } else {
+                <F as Poseidon2>::external_linear_layer_circuit(builder, &mut state);
+            }
         }
 
         for i in 0..SPONGE_WIDTH {
@@ -416,8 +439,44 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
     }
 }
 
-// Helpers for Extension algebra linear layers which are not in the trait
+// Helpers for MDS gate integration and Extension algebra linear layers
 impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Poseidon2Gate<F, D> {
+    /// Apply external linear layer via the combined MDS gate.
+    /// This replaces ~50 arithmetic operations with a single gate row + copy constraints.
+    fn external_layer_via_gate(
+        builder: &mut CircuitBuilder<F, D>,
+        state: &mut [ExtensionTarget<D>; SPONGE_WIDTH],
+    ) {
+        let gate = Poseidon2MdsGate::<F, D>::new();
+        let index = builder.add_gate(gate, vec![]);
+        for i in 0..SPONGE_WIDTH {
+            let input_wire = Poseidon2MdsGate::<F, D>::wires_input(i);
+            builder.connect_extension(state[i], ExtensionTarget::from_range(index, input_wire));
+        }
+        for i in 0..SPONGE_WIDTH {
+            let output_wire = Poseidon2MdsGate::<F, D>::wires_external_output(i);
+            state[i] = ExtensionTarget::from_range(index, output_wire);
+        }
+    }
+
+    /// Apply internal linear layer via the combined MDS gate.
+    /// This replaces ~47 arithmetic operations with a single gate row + copy constraints.
+    fn internal_layer_via_gate(
+        builder: &mut CircuitBuilder<F, D>,
+        state: &mut [ExtensionTarget<D>; SPONGE_WIDTH],
+    ) {
+        let gate = Poseidon2MdsGate::<F, D>::new();
+        let index = builder.add_gate(gate, vec![]);
+        for i in 0..SPONGE_WIDTH {
+            let input_wire = Poseidon2MdsGate::<F, D>::wires_input(i);
+            builder.connect_extension(state[i], ExtensionTarget::from_range(index, input_wire));
+        }
+        for i in 0..SPONGE_WIDTH {
+            let output_wire = Poseidon2MdsGate::<F, D>::wires_internal_output(i);
+            state[i] = ExtensionTarget::from_range(index, output_wire);
+        }
+    }
+
     fn external_linear_layer_extension(state: &mut [F::Extension; SPONGE_WIDTH]) {
         // We replicate the Goldilocks-12 logic for extensions.
         // This makes assumptions about the matrix structure matching the specific Goldilocks implementation.
