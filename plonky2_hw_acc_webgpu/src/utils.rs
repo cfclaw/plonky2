@@ -58,6 +58,9 @@ pub fn upload_u64_data(
 
 /// Download data from a GPU buffer into a Vec<GoldilocksField>.
 /// This is a blocking operation that maps the buffer, reads, and unmaps.
+///
+/// On native: uses std::sync::mpsc channel + device.poll(Wait).
+/// On WASM: wgpu's WebGPU backend handles poll(Wait) internally via microtask queue.
 pub fn download_field_data(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -75,12 +78,19 @@ pub fn download_field_data(
     queue.submit(Some(encoder.finish()));
 
     let buffer_slice = staging.slice(..);
-    let (sender, receiver) = std::sync::mpsc::channel();
+
+    // On native, device.poll(Wait) blocks until the map callback fires.
+    // On WASM, wgpu's WebGPU backend processes the callback synchronously
+    // within poll(Wait) via the microtask queue.
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let done = Arc::new(AtomicBool::new(false));
+    let done_clone = done.clone();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap();
+        result.unwrap();
+        done_clone.store(true, Ordering::SeqCst);
     });
     device.poll(wgpu::Maintain::Wait);
-    receiver.recv().unwrap().unwrap();
+    assert!(done.load(Ordering::SeqCst), "Buffer mapping did not complete");
 
     let data = buffer_slice.get_mapped_range();
     let result: Vec<GoldilocksField> = unsafe {

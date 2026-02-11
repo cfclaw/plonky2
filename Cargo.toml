@@ -1,5 +1,6 @@
 [workspace]
-members = ["field", "maybe_rayon", "plonky2", "starky", "util", "plonky2_poseidon2"]
+members = ["field", "maybe_rayon", "plonky2", "starky", "util", "plonky2_poseidon2", "plonky2_hw_acc_webgpu"]
+exclude = ["web-demos/plonky2-wasm-cpu", "web-demos/plonky2-wasm-webgpu"]
 resolver = "2"
 
 [workspace.dependencies]
