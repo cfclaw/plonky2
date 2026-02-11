@@ -196,20 +196,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
-    /// When `async_prover` is enabled, `prove()` in `prover.rs` returns a future.
-    /// This convenience wrapper drives it to completion synchronously using a
-    /// minimal no-op-waker poll loop. This works for `CpuProverCompute` (which
-    /// has no yield points) and will panic if the future yields (e.g. on WASM
-    /// with WebGPU). For GPU-accelerated async proving, call
-    /// `plonky2::plonk::prover::prove()` directly and `.await` the result.
     #[cfg(feature = "async_prover")]
-    pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
-        crate::block_on_simple(prove::<F, C, D>(
+    pub async fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
+        prove::<F, C, D>(
             &self.prover_only,
             &self.common,
             inputs,
             &mut TimingTree::default(),
-        ))
+        ).await
     }
 
     pub fn verify(&self, proof_with_pis: ProofWithPublicInputs<F, C, D>) -> Result<()> {
@@ -312,13 +306,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     }
 
     #[cfg(feature = "async_prover")]
-    pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
-        crate::block_on_simple(prove::<F, C, D>(
+    pub async fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
+        prove::<F, C, D>(
             &self.prover_only,
             &self.common,
             inputs,
             &mut TimingTree::default(),
-        ))
+        ).await
     }
 }
 

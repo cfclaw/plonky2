@@ -137,7 +137,10 @@ pub fn test_stark_circuit_constraints<
     builder.connect_extension(circuit_eval, native_eval_t);
 
     let data = builder.build::<C>();
+    #[cfg(not(feature = "async_prover"))]
     let proof = data.prove(pw)?;
+    #[cfg(feature = "async_prover")]
+    let proof = plonky2::block_on_simple(data.prove(pw))?;
     data.verify(proof)
 }
 

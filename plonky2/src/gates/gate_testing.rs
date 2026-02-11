@@ -158,6 +158,9 @@ pub fn test_eval_fns<
     pw.set_extension_targets(&evals_t, &evals)?;
 
     let data = builder.build::<C>();
+    #[cfg(not(feature = "async_prover"))]
     let proof = data.prove(pw)?;
+    #[cfg(feature = "async_prover")]
+    let proof = crate::block_on_simple(data.prove(pw))?;
     verify::<F, C, D>(proof, &data.verifier_only, &data.common)
 }

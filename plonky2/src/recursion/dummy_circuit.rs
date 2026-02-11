@@ -33,58 +33,71 @@ use crate::plonk::proof::{
 };
 use crate::util::serialization::{Buffer, DefaultGateSerializer, IoResult, Read, Write};
 
-/// Creates a dummy proof which is suitable for use as a base proof in a cyclic recursion tree.
-/// Such a base proof will not actually be verified, so most of its data is arbitrary. However, its
-/// public inputs which encode the cyclic verification key must be set properly, and this method
-/// takes care of that. It also allows the user to specify any other public inputs which should be
-/// set in this base proof.
-pub fn cyclic_base_proof<F, C, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-    verifier_data: &VerifierOnlyCircuitData<C, D>,
-    mut nonzero_public_inputs: HashMap<usize, F>,
-) -> ProofWithPublicInputs<F, C, D>
-where
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    C::Hasher: AlgebraicHasher<C::F>,
-{
-    let pis_len = common_data.num_public_inputs;
-    let cap_elements = common_data.config.fri_config.num_cap_elements();
-    let start_vk_pis = pis_len - 4 - 4 * cap_elements;
+macro_rules! impl_cyclic_base_proof {
+    ($($async_kw:tt)*) => {
+        /// Creates a dummy proof which is suitable for use as a base proof in a cyclic recursion tree.
+        pub $($async_kw)* fn cyclic_base_proof<F, C, const D: usize>(
+            common_data: &CommonCircuitData<F, D>,
+            verifier_data: &VerifierOnlyCircuitData<C, D>,
+            mut nonzero_public_inputs: HashMap<usize, F>,
+        ) -> ProofWithPublicInputs<F, C, D>
+        where
+            F: RichField + Extendable<D>,
+            C: GenericConfig<D, F = F>,
+            C::Hasher: AlgebraicHasher<C::F>,
+        {
+            let pis_len = common_data.num_public_inputs;
+            let cap_elements = common_data.config.fri_config.num_cap_elements();
+            let start_vk_pis = pis_len - 4 - 4 * cap_elements;
 
-    // Add the cyclic verifier data public inputs.
-    nonzero_public_inputs.extend((start_vk_pis..).zip(verifier_data.circuit_digest.elements));
-    for i in 0..cap_elements {
-        let start = start_vk_pis + 4 + 4 * i;
-        nonzero_public_inputs
-            .extend((start..).zip(verifier_data.constants_sigmas_cap.0[i].elements));
-    }
+            nonzero_public_inputs.extend((start_vk_pis..).zip(verifier_data.circuit_digest.elements));
+            for i in 0..cap_elements {
+                let start = start_vk_pis + 4 + 4 * i;
+                nonzero_public_inputs
+                    .extend((start..).zip(verifier_data.constants_sigmas_cap.0[i].elements));
+            }
 
-    // TODO: A bit wasteful to build a dummy circuit here. We could potentially use a proof that
-    // just consists of zeros, apart from public inputs.
-    dummy_proof::<F, C, D>(
-        &dummy_circuit::<F, C, D>(common_data),
-        nonzero_public_inputs,
-    )
-    .unwrap()
+            $crate::maybe_await!(dummy_proof::<F, C, D>(
+                &dummy_circuit::<F, C, D>(common_data),
+                nonzero_public_inputs,
+            ))
+            .unwrap()
+        }
+    };
 }
 
-/// Generate a proof for a dummy circuit. The `public_inputs` parameter let the caller specify
-/// certain public inputs (identified by their indices) which should be given specific values.
-/// The rest will default to zero.
-pub fn dummy_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
-    circuit: &CircuitData<F, C, D>,
-    nonzero_public_inputs: HashMap<usize, F>,
-) -> anyhow::Result<ProofWithPublicInputs<F, C, D>>
-where
-{
-    let mut pw = PartialWitness::new();
-    for i in 0..circuit.common.num_public_inputs {
-        let pi = nonzero_public_inputs.get(&i).copied().unwrap_or_default();
-        pw.set_target(circuit.prover_only.public_inputs[i], pi)?;
-    }
-    circuit.prove(pw)
+#[cfg(not(feature = "async_prover"))]
+impl_cyclic_base_proof!();
+
+#[cfg(feature = "async_prover")]
+impl_cyclic_base_proof!(async);
+
+macro_rules! impl_dummy_proof {
+    ($($async_kw:tt)*) => {
+        /// Generate a proof for a dummy circuit. The `public_inputs` parameter let the caller specify
+        /// certain public inputs (identified by their indices) which should be given specific values.
+        /// The rest will default to zero.
+        pub $($async_kw)* fn dummy_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+            circuit: &CircuitData<F, C, D>,
+            nonzero_public_inputs: HashMap<usize, F>,
+        ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>>
+        where
+        {
+            let mut pw = PartialWitness::new();
+            for i in 0..circuit.common.num_public_inputs {
+                let pi = nonzero_public_inputs.get(&i).copied().unwrap_or_default();
+                pw.set_target(circuit.prover_only.public_inputs[i], pi)?;
+            }
+            $crate::maybe_await!(circuit.prove(pw))
+        }
+    };
 }
+
+#[cfg(not(feature = "async_prover"))]
+impl_dummy_proof!();
+
+#[cfg(feature = "async_prover")]
+impl_dummy_proof!(async);
 
 /// Generate a circuit matching a given `CommonCircuitData`.
 pub fn dummy_circuit<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -126,7 +139,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         C::Hasher: AlgebraicHasher<F>,
     {
         let dummy_circuit = dummy_circuit::<F, C, D>(common_data);
+        // Builder infrastructure: always sync, always CpuProverCompute (never yields).
+        #[cfg(not(feature = "async_prover"))]
         let dummy_proof_with_pis = dummy_proof::<F, C, D>(&dummy_circuit, HashMap::new())?;
+        #[cfg(feature = "async_prover")]
+        let dummy_proof_with_pis = crate::block_on_simple(dummy_proof::<F, C, D>(&dummy_circuit, HashMap::new()))?;
         let dummy_proof_with_pis_target = self.add_virtual_proof_with_pis(common_data);
         let dummy_verifier_data_target =
             self.add_virtual_verifier_data(self.config.fri_config.cap_height);
