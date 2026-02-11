@@ -97,17 +97,15 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
 
         reverse_index_bits_in_place(&mut values.values);
         let leaf_len = arity * D;
-        let num_leaves = values.values.len() / arity;
-        let mut flat_leaves = vec![F::ZERO; num_leaves * leaf_len];
-        flat_leaves
-            .par_chunks_exact_mut(leaf_len)
-            .zip(values.values.par_chunks_exact(arity))
-            .for_each(|(out_leaf, in_chunk)| {
-                for (j, ext) in in_chunk.iter().enumerate() {
-                    let arr = ext.to_basefield_array();
-                    out_leaf[j * D..(j + 1) * D].copy_from_slice(&arr);
-                }
-            });
+        let flat_leaves: Vec<F> = values
+            .values
+            .chunks_exact(arity)
+            .flat_map(|chunk| {
+                chunk
+                    .iter()
+                    .flat_map(|ext| ext.to_basefield_array())
+            })
+            .collect();
         let tree = MerkleTree::<F, C::Hasher>::new_from_flat(flat_leaves, leaf_len, fri_params.config.cap_height);
 
         challenger.observe_cap(&tree.cap);

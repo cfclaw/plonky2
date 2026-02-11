@@ -35,15 +35,24 @@ pub fn transpose<T: Send + Sync + Copy + Default>(matrix: &[Vec<T>]) -> Vec<Vec<
         .map(|_| vec![T::default(); nrows])
         .collect();
 
-    // Process in cache-friendly tiles.
+    // For small matrices, skip tiling overhead.
     const TILE: usize = 64;
-    for row_start in (0..nrows).step_by(TILE) {
-        let row_end = (row_start + TILE).min(nrows);
-        for col_start in (0..ncols).step_by(TILE) {
-            let col_end = (col_start + TILE).min(ncols);
-            for r in row_start..row_end {
-                for c in col_start..col_end {
-                    result[c][r] = matrix[r][c];
+    if nrows <= TILE && ncols <= TILE {
+        for r in 0..nrows {
+            for c in 0..ncols {
+                result[c][r] = matrix[r][c];
+            }
+        }
+    } else {
+        // Process in cache-friendly tiles.
+        for row_start in (0..nrows).step_by(TILE) {
+            let row_end = (row_start + TILE).min(nrows);
+            for col_start in (0..ncols).step_by(TILE) {
+                let col_end = (col_start + TILE).min(ncols);
+                for r in row_start..row_end {
+                    for c in col_start..col_end {
+                        result[c][r] = matrix[r][c];
+                    }
                 }
             }
         }
@@ -85,17 +94,23 @@ pub fn transpose_to_flat<T: Send + Sync + Copy + Default>(matrix: &[Vec<T>]) -> 
     let ncols = matrix[0].len();
     let mut flat = vec![T::default(); nrows * ncols];
 
-    // Process in cache-friendly tiles.
     const TILE: usize = 64;
-    for row_start in (0..nrows).step_by(TILE) {
-        let row_end = (row_start + TILE).min(nrows);
-        for col_start in (0..ncols).step_by(TILE) {
-            let col_end = (col_start + TILE).min(ncols);
-            for r in row_start..row_end {
-                for c in col_start..col_end {
-                    // output[c][r] = matrix[r][c]
-                    // In flat layout: index = c * nrows + r
-                    flat[c * nrows + r] = matrix[r][c];
+    if nrows <= TILE && ncols <= TILE {
+        for r in 0..nrows {
+            for c in 0..ncols {
+                flat[c * nrows + r] = matrix[r][c];
+            }
+        }
+    } else {
+        // Process in cache-friendly tiles.
+        for row_start in (0..nrows).step_by(TILE) {
+            let row_end = (row_start + TILE).min(nrows);
+            for col_start in (0..ncols).step_by(TILE) {
+                let col_end = (col_start + TILE).min(ncols);
+                for r in row_start..row_end {
+                    for c in col_start..col_end {
+                        flat[c * nrows + r] = matrix[r][c];
+                    }
                 }
             }
         }

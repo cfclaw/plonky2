@@ -57,9 +57,17 @@ pub fn generate_partial_witness<
     let mut generator_is_queued = vec![false; generators.len()];
     let mut pending_generator_indices = Vec::new();
 
-    // Queue generators with empty watch lists.
-    for (i, gen) in generators.iter().enumerate() {
-        if gen.0.watch_list().is_empty() {
+    // Find generators that have watches (appear in at least one watch list).
+    let mut has_watches = vec![false; generators.len()];
+    for indices in generator_indices_by_watches.values() {
+        for &idx in indices {
+            has_watches[idx] = true;
+        }
+    }
+
+    // Queue generators with empty watch lists (no dependencies).
+    for i in 0..generators.len() {
+        if !has_watches[i] {
             pending_generator_indices.push(i);
             generator_is_queued[i] = true;
         }
