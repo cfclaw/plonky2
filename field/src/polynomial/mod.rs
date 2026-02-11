@@ -87,7 +87,7 @@ impl<F: Field> PolynomialValues<F> {
     /// Low-degree extend `Self` (seen as evaluations over the subgroup) onto a coset.
     pub fn lde_onto_coset(self, rate_bits: usize) -> Self {
         let coeffs = ifft(self).lde(rate_bits);
-        coeffs.coset_fft_with_options(F::coset_shift(), Some(rate_bits), None)
+        coeffs.coset_fft_with_options_consume(F::coset_shift(), Some(rate_bits), None)
     }
 
     pub fn degree(&self) -> usize {
@@ -289,13 +289,24 @@ impl<F: Field> PolynomialCoeffs<F> {
         zero_factor: Option<usize>,
         root_table: Option<&FftRootTable<F>>,
     ) -> PolynomialValues<F> {
-        let modified_poly: Self = shift
-            .powers()
-            .zip(&self.coeffs)
-            .map(|(r, &c)| r * c)
-            .collect::<Vec<_>>()
-            .into();
-        modified_poly.fft_with_options(zero_factor, root_table)
+        self.clone()
+            .coset_fft_with_options_consume(shift, zero_factor, root_table)
+    }
+
+    /// Consuming version: applies coset shift in-place, then FFTs.
+    /// Avoids a full polynomial copy compared to `coset_fft_with_options`.
+    pub fn coset_fft_with_options_consume(
+        mut self,
+        shift: F,
+        zero_factor: Option<usize>,
+        root_table: Option<&FftRootTable<F>>,
+    ) -> PolynomialValues<F> {
+        let mut s_pow = F::ONE;
+        for c in self.coeffs.iter_mut() {
+            *c *= s_pow;
+            s_pow *= shift;
+        }
+        self.fft_with_options(zero_factor, root_table)
     }
 
     pub fn to_extension<const D: usize>(&self) -> PolynomialCoeffs<F::Extension>

@@ -120,7 +120,7 @@ pub(crate) fn batch_fri_committed_trees<
                 .collect::<Vec<_>>(),
         );
         shift = shift.exp_u64(arity as u64);
-        final_values = final_coeffs.coset_fft(shift.into());
+        final_values = final_coeffs.coset_fft_with_options_consume(shift.into(), None, None);
         if polynomial_index != values.len() && final_values.len() == values[polynomial_index].len()
         {
             final_values = PolynomialValues::new(

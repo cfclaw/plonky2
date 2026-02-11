@@ -74,12 +74,13 @@ pub trait Hasher<F: RichField>:
     /// no-op.
     fn hash_or_noop(inputs: &[F]) -> Self::Hash {
         if inputs.len() * 8 <= Self::HASH_SIZE {
-            let mut inputs_bytes = vec![0u8; Self::HASH_SIZE];
+            let mut inputs_bytes = [0u8; 64]; // stack-allocated, large enough for any HASH_SIZE
+            debug_assert!(Self::HASH_SIZE <= 64);
             for i in 0..inputs.len() {
                 inputs_bytes[i * 8..(i + 1) * 8]
                     .copy_from_slice(&inputs[i].to_canonical_u64().to_le_bytes());
             }
-            Self::Hash::from_bytes(&inputs_bytes)
+            Self::Hash::from_bytes(&inputs_bytes[..Self::HASH_SIZE])
         } else {
             Self::hash_no_pad(inputs)
         }
@@ -175,7 +176,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 .par_iter()
                 .map(|p| {
                     p.lde(rate_bits)
-                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                        .coset_fft_with_options_consume(
+                            F::coset_shift(),
+                            Some(rate_bits),
+                            fft_root_table,
+                        )
                         .values
                 })
                 .chain(

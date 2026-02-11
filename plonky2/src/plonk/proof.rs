@@ -326,24 +326,39 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .map(|p| p.to_extension().eval(z))
                 .collect::<Vec<_>>()
         };
-        let constants_sigmas_eval = eval_commitment(zeta, constants_sigmas_commitment);
+        let eval_commitment_range =
+            |z: F::Extension,
+             c: &PolynomialBatch<F, C, D>,
+             range: core::ops::Range<usize>| {
+                c.polynomials[range]
+                    .par_iter()
+                    .map(|p| p.to_extension().eval(z))
+                    .collect::<Vec<_>>()
+            };
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval =
             eval_commitment(zeta, zs_partial_products_lookup_commitment);
         let zs_partial_products_lookup_next_eval =
             eval_commitment(g * zeta, zs_partial_products_lookup_commitment);
-        let quotient_polys = eval_commitment(zeta, quotient_polys_commitment);
 
         Self {
-            constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
-            plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
+            constants: eval_commitment_range(
+                zeta,
+                constants_sigmas_commitment,
+                common_data.constants_range(),
+            ),
+            plonk_sigmas: eval_commitment_range(
+                zeta,
+                constants_sigmas_commitment,
+                common_data.sigmas_range(),
+            ),
             wires: eval_commitment(zeta, wires_commitment),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             plonk_zs_next: zs_partial_products_lookup_next_eval[common_data.zs_range()].to_vec(),
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
-            quotient_polys,
+            quotient_polys: eval_commitment(zeta, quotient_polys_commitment),
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
             lookup_zs_next: zs_partial_products_lookup_next_eval[common_data.lookup_range()]
                 .to_vec(),

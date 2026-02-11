@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use serde::{Serialize, Serializer};
 
-use crate::field::batch_util::batch_multiply_inplace;
+use crate::field::batch_util::{batch_add_inplace, batch_multiply_inplace};
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
 use crate::gates::selectors::UNUSED_SELECTOR;
@@ -182,6 +182,38 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             batch_multiply_inplace(res_chunk, &filters);
         }
         res_batch
+    }
+
+    /// Like `eval_filtered_base_batch`, but accumulates results directly into `output`,
+    /// avoiding an extra allocation when the caller already has a buffer.
+    fn eval_filtered_base_batch_into(
+        &self,
+        mut vars_batch: EvaluationVarsBaseBatch<F>,
+        row: usize,
+        selector_index: usize,
+        group_range: Range<usize>,
+        num_selectors: usize,
+        num_lookup_selectors: usize,
+        output: &mut [F],
+    ) {
+        let filters: Vec<_> = vars_batch
+            .iter()
+            .map(|vars| {
+                compute_filter(
+                    row,
+                    group_range.clone(),
+                    vars.local_constants[selector_index],
+                    num_selectors > 1,
+                )
+            })
+            .collect();
+        vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
+        let mut res_batch = self.eval_unfiltered_base_batch(vars_batch);
+        let res_len = res_batch.len();
+        for res_chunk in res_batch.chunks_exact_mut(filters.len()) {
+            batch_multiply_inplace(res_chunk, &filters);
+        }
+        batch_add_inplace(&mut output[..res_len], &res_batch);
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.

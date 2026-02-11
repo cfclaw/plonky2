@@ -660,12 +660,12 @@ fn compute_quotient_polys_pre_transpose<
             let indices_batch: Vec<usize> = (BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n).collect();
 
             let mut shifted_xs_batch = Vec::with_capacity(n);
-            let mut local_zs_batch_vecs = Vec::with_capacity(n);
-            let mut next_zs_batch_vecs = Vec::with_capacity(n);
-            let mut local_lookup_batch_vecs = Vec::with_capacity(n);
-            let mut next_lookup_batch_vecs = Vec::with_capacity(n);
-            let mut partial_products_batch_vecs = Vec::with_capacity(n);
-            let mut s_sigmas_batch_vecs = Vec::with_capacity(n);
+            let mut local_zs_batch: Vec<&[F]> = Vec::with_capacity(n);
+            let mut next_zs_batch: Vec<&[F]> = Vec::with_capacity(n);
+            let mut local_lookup_batch: Vec<&[F]> = Vec::with_capacity(n);
+            let mut next_lookup_batch: Vec<&[F]> = Vec::with_capacity(n);
+            let mut partial_products_batch: Vec<&[F]> = Vec::with_capacity(n);
+            let mut s_sigmas_batch: Vec<&[F]> = Vec::with_capacity(n);
 
             let mut local_constants_batch = vec![F::ZERO; n * common_data.num_constants];
             let mut local_wires_batch = vec![F::ZERO; n * common_data.config.num_wires];
@@ -679,13 +679,13 @@ fn compute_quotient_polys_pre_transpose<
                 let local_zs_partial_and_lookup = zs_partial_products_and_lookup_commitment.get_lde_values(i, step);
                 let next_zs_partial_and_lookup = zs_partial_products_and_lookup_commitment.get_lde_values(i_next, step);
 
-                s_sigmas_batch_vecs.push(local_constants_sigmas[common_data.sigmas_range()].to_vec());
-                local_zs_batch_vecs.push(local_zs_partial_and_lookup[common_data.zs_range()].to_vec());
-                next_zs_batch_vecs.push(next_zs_partial_and_lookup[common_data.zs_range()].to_vec());
-                partial_products_batch_vecs.push(local_zs_partial_and_lookup[common_data.partial_products_range()].to_vec());
+                s_sigmas_batch.push(&local_constants_sigmas[common_data.sigmas_range()]);
+                local_zs_batch.push(&local_zs_partial_and_lookup[common_data.zs_range()]);
+                next_zs_batch.push(&next_zs_partial_and_lookup[common_data.zs_range()]);
+                partial_products_batch.push(&local_zs_partial_and_lookup[common_data.partial_products_range()]);
                 if has_lookup {
-                    local_lookup_batch_vecs.push(local_zs_partial_and_lookup[common_data.lookup_range()].to_vec());
-                    next_lookup_batch_vecs.push(next_zs_partial_and_lookup[common_data.lookup_range()].to_vec());
+                    local_lookup_batch.push(&local_zs_partial_and_lookup[common_data.lookup_range()]);
+                    next_lookup_batch.push(&next_zs_partial_and_lookup[common_data.lookup_range()]);
                 }
 
                 for (j, &c) in local_constants_sigmas[common_data.constants_range()].iter().enumerate() {
@@ -695,13 +695,6 @@ fn compute_quotient_polys_pre_transpose<
                     local_wires_batch[j * n + k] = w;
                 }
             }
-            
-            let local_zs_batch: Vec<&[F]> = local_zs_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let next_zs_batch: Vec<&[F]> = next_zs_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let local_lookup_batch: Vec<&[F]> = local_lookup_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let next_lookup_batch: Vec<&[F]> = next_lookup_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let partial_products_batch: Vec<&[F]> = partial_products_batch_vecs.iter().map(|v| v.as_slice()).collect();
-            let s_sigmas_batch: Vec<&[F]> = s_sigmas_batch_vecs.iter().map(|v| v.as_slice()).collect();
             
             let vars_batch = EvaluationVarsBaseBatch::new(
                 n,

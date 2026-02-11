@@ -141,5 +141,15 @@ pub fn hash_n_to_m_no_pad<F: RichField, P: PlonkyPermutation<F>>(
 }
 
 pub fn hash_n_to_hash_no_pad<F: RichField, P: PlonkyPermutation<F>>(inputs: &[F]) -> HashOut<F> {
-    HashOut::from_vec(hash_n_to_m_no_pad::<F, P>(inputs, NUM_HASH_OUT_ELTS))
+    let mut perm = P::new(core::iter::repeat(F::ZERO));
+
+    // Absorb all input chunks.
+    for input_chunk in inputs.chunks(P::RATE) {
+        perm.set_from_slice(input_chunk, 0);
+        perm.permute();
+    }
+
+    HashOut {
+        elements: perm.squeeze()[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    }
 }
