@@ -51,6 +51,58 @@ pub fn transpose<T: Send + Sync + Copy + Default>(matrix: &[Vec<T>]) -> Vec<Vec<
     result
 }
 
+/// Perform bit-reversal permutation on flat leaf data.
+/// Swaps leaf `i` with leaf `bit_reverse(i)` for all `i`.
+pub fn reverse_index_bits_in_place_flat<T: Copy>(flat: &mut [T], leaf_len: usize, num_leaves: usize) {
+    let lb_n = log2_strict(num_leaves);
+    for i in 0..num_leaves {
+        let j = reverse_bits(i, lb_n);
+        if i < j {
+            // Swap leaf i and leaf j
+            let (a, b) = if i < j {
+                let (left, right) = flat.split_at_mut(j * leaf_len);
+                (
+                    &mut left[i * leaf_len..(i + 1) * leaf_len],
+                    &mut right[..leaf_len],
+                )
+            } else {
+                unreachable!()
+            };
+            a.swap_with_slice(b);
+        }
+    }
+}
+
+/// Transpose a matrix into a flat buffer.
+/// Input: matrix[nrows][ncols] (row-major, each row is a Vec).
+/// Output: flat buffer of length ncols * nrows, where output row `c` starts at `c * nrows`.
+/// Returns (flat_data, row_len) where row_len == nrows (the "leaf length" in Merkle context).
+pub fn transpose_to_flat<T: Send + Sync + Copy + Default>(matrix: &[Vec<T>]) -> (Vec<T>, usize) {
+    let nrows = matrix.len();
+    if nrows == 0 {
+        return (vec![], 0);
+    }
+    let ncols = matrix[0].len();
+    let mut flat = vec![T::default(); nrows * ncols];
+
+    // Process in cache-friendly tiles.
+    const TILE: usize = 64;
+    for row_start in (0..nrows).step_by(TILE) {
+        let row_end = (row_start + TILE).min(nrows);
+        for col_start in (0..ncols).step_by(TILE) {
+            let col_end = (col_start + TILE).min(ncols);
+            for r in row_start..row_end {
+                for c in col_start..col_end {
+                    // output[c][r] = matrix[r][c]
+                    // In flat layout: index = c * nrows + r
+                    flat[c * nrows + r] = matrix[r][c];
+                }
+            }
+        }
+    }
+    (flat, nrows)
+}
+
 pub(crate) const fn reverse_bits(n: usize, num_bits: usize) -> usize {
     // NB: The only reason we need overflowing_shr() here as opposed
     // to plain '>>' is to accommodate the case n == num_bits == 0,

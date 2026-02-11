@@ -320,11 +320,17 @@ pub trait Read {
         F: RichField,
         H: Hasher<F>,
     {
-        let leaves_len = self.read_usize()?;
-        let mut leaves = Vec::with_capacity(leaves_len);
-        for _ in 0..leaves_len {
-            let leaf_len = self.read_usize()?;
-            leaves.push(self.read_field_vec(leaf_len)?);
+        let num_leaves = self.read_usize()?;
+        let mut flat_leaves = Vec::new();
+        let mut leaf_len = 0;
+        for i in 0..num_leaves {
+            let this_leaf_len = self.read_usize()?;
+            if i == 0 {
+                leaf_len = this_leaf_len;
+                flat_leaves.reserve(num_leaves * leaf_len);
+            }
+            let leaf_data = self.read_field_vec(this_leaf_len)?;
+            flat_leaves.extend_from_slice(&leaf_data);
         }
 
         let digests_len = self.read_usize()?;
@@ -332,7 +338,8 @@ pub trait Read {
         let cap_height = self.read_usize()?;
         let cap = self.read_merkle_cap::<F, H>(cap_height)?;
         Ok(MerkleTree {
-            leaves,
+            leaves: flat_leaves,
+            leaf_len,
             digests,
             cap,
         })
@@ -1419,10 +1426,12 @@ pub trait Write {
         F: RichField,
         H: Hasher<F>,
     {
-        self.write_usize(tree.leaves.len())?;
-        for i in 0..tree.leaves.len() {
-            self.write_usize(tree.leaves[i].len())?;
-            self.write_field_vec(&tree.leaves[i])?;
+        let num_leaves = tree.num_leaves();
+        self.write_usize(num_leaves)?;
+        for i in 0..num_leaves {
+            let leaf = tree.get(i);
+            self.write_usize(leaf.len())?;
+            self.write_field_vec(leaf)?;
         }
         self.write_hash_vec::<F, H>(&tree.digests)?;
         self.write_usize(tree.cap.height())?;

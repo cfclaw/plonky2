@@ -43,13 +43,39 @@ pub fn generate_partial_witness<
         &prover_data.representative_map,
     );
 
+    // Track which representatives are populated by the initial inputs.
+    let mut initial_reps = Vec::new();
     for (t, v) in inputs.target_values.into_iter() {
-        witness.set_target(t, v)?;
+        let rep = witness.set_target_returning_rep(t, v)?;
+        if let Some(r) = rep {
+            initial_reps.push(r);
+        }
     }
 
-    // Build a list of "pending" generators which are queued to be run. Initially, all generators
-    // are queued.
-    let mut pending_generator_indices: Vec<_> = (0..generators.len()).collect();
+    // Build the initial pending list: only generators with no watch list (can always run)
+    // plus generators watching representatives that were populated by the initial inputs.
+    let mut generator_is_queued = vec![false; generators.len()];
+    let mut pending_generator_indices = Vec::new();
+
+    // Queue generators with empty watch lists.
+    for (i, gen) in generators.iter().enumerate() {
+        if gen.0.watch_list().is_empty() {
+            pending_generator_indices.push(i);
+            generator_is_queued[i] = true;
+        }
+    }
+
+    // Queue generators watching the initially-populated representatives.
+    for rep in &initial_reps {
+        if let Some(watchers) = generator_indices_by_watches.get(rep) {
+            for &gen_idx in watchers {
+                if !generator_is_queued[gen_idx] {
+                    pending_generator_indices.push(gen_idx);
+                    generator_is_queued[gen_idx] = true;
+                }
+            }
+        }
+    }
 
     // We also track a list of "expired" generators which have already returned false.
     let mut generator_is_expired = vec![false; generators.len()];
@@ -60,6 +86,10 @@ pub fn generate_partial_witness<
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
         let mut next_pending_generator_indices = Vec::new();
+        // Reset queued flags for the next round.
+        for &idx in &pending_generator_indices {
+            generator_is_queued[idx] = false;
+        }
 
         for &generator_idx in &pending_generator_indices {
             if generator_is_expired[generator_idx] {
@@ -82,11 +112,13 @@ pub fn generate_partial_witness<
 
             // Enqueue unfinished generators that were watching one of the newly populated targets.
             for watch in new_target_reps {
-                let opt_watchers = generator_indices_by_watches.get(&watch);
-                if let Some(watchers) = opt_watchers {
+                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                     for &watching_generator_idx in watchers {
-                        if !generator_is_expired[watching_generator_idx] {
+                        if !generator_is_expired[watching_generator_idx]
+                            && !generator_is_queued[watching_generator_idx]
+                        {
                             next_pending_generator_indices.push(watching_generator_idx);
+                            generator_is_queued[watching_generator_idx] = true;
                         }
                     }
                 }

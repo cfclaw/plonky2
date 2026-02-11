@@ -31,7 +31,7 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::timed;
 use crate::util::timing::TimingTree;
-use crate::util::{reverse_index_bits_in_place, transpose};
+use crate::util::{reverse_index_bits_in_place_flat, transpose, transpose_to_flat};
 
 pub trait GenericHashOut<F: RichField>:
     Copy + Clone + Debug + Eq + PartialEq + Send + Sync + Serialize + DeserializeOwned
@@ -146,6 +146,13 @@ pub trait ProverCompute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>
         leaves: Vec<Vec<F>>,
         cap_height: usize,
     ) -> anyhow::Result<MerkleTree<F, C::Hasher>>;
+
+    fn build_merkle_tree_flat(
+        timing: &mut TimingTree,
+        flat_leaves: Vec<F>,
+        leaf_len: usize,
+        cap_height: usize,
+    ) -> anyhow::Result<MerkleTree<F, C::Hasher>>;
 }
 
 /// Default CPU implementation of `ProverCompute`.
@@ -191,13 +198,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 .collect()
         );
 
-        let mut leaves = transpose(&lde_values);
-        reverse_index_bits_in_place(&mut leaves);
+        let (mut flat_leaves, leaf_len) = transpose_to_flat(&lde_values);
+        let num_leaves = if leaf_len == 0 { 0 } else { flat_leaves.len() / leaf_len };
+        reverse_index_bits_in_place_flat(&mut flat_leaves, leaf_len, num_leaves);
 
         let merkle_tree = timed!(
             timing,
             "Merkle tree",
-            <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)?
+            <Self as ProverCompute<F, C, D>>::build_merkle_tree_flat(timing, flat_leaves, leaf_len, cap_height)?
         );
         Ok(PolynomialBatch {
             polynomials,
@@ -290,6 +298,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> anyhow::Result<MerkleTree<F, C::Hasher>> {
         //println!("CPU ProverCompute::build_merkle_tree called");
         let merkle_tree = timed!(timing, "Merkle tree", MerkleTree::new(leaves, cap_height));
+        Ok(merkle_tree)
+    }
+
+    fn build_merkle_tree_flat(
+        timing: &mut TimingTree,
+        flat_leaves: Vec<F>,
+        leaf_len: usize,
+        cap_height: usize,
+    ) -> anyhow::Result<MerkleTree<F, C::Hasher>> {
+        let merkle_tree = timed!(timing, "Merkle tree", MerkleTree::new_from_flat(flat_leaves, leaf_len, cap_height));
         Ok(merkle_tree)
     }
 }

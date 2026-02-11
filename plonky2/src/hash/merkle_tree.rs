@@ -49,8 +49,12 @@ impl<F: RichField, H: Hasher<F>> MerkleCap<F, H> {
 #[cfg_attr(feature = "serialize_speedy", derive(speedy::Readable, speedy::Writable))]
 #[repr(C)]
 pub struct MerkleTree<F: RichField, H: Hasher<F>> {
-    /// The data in the leaves of the Merkle tree.
-    pub leaves: Vec<Vec<F>>,
+    /// The data in the leaves of the Merkle tree, stored as a flat contiguous buffer.
+    /// Leaf `i` occupies `leaves[i * leaf_len..(i + 1) * leaf_len]`.
+    pub leaves: Vec<F>,
+
+    /// The number of field elements per leaf.
+    pub leaf_len: usize,
 
     /// The digests in the tree. Consists of `cap.len()` sub-trees, each corresponding to one
     /// element in `cap`. Each subtree is contiguous and located at
@@ -70,6 +74,7 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
     fn default() -> Self {
         Self {
             leaves: Vec::new(),
+            leaf_len: 0,
             digests: Vec::new(),
             cap: MerkleCap::default(),
         }
@@ -90,11 +95,13 @@ pub(crate) fn capacity_up_to_mut<T>(v: &mut Vec<T>, len: usize) -> &mut [MaybeUn
 
 pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
-    leaves: &[Vec<F>],
+    leaves: &[F],
+    leaf_len: usize,
 ) -> H::Hash {
-    assert_eq!(leaves.len(), digests_buf.len() / 2 + 1);
+    let num_leaves = leaves.len() / leaf_len;
+    assert_eq!(num_leaves, digests_buf.len() / 2 + 1);
     if digests_buf.is_empty() {
-        H::hash_or_noop(&leaves[0])
+        H::hash_or_noop(&leaves[..leaf_len])
     } else {
         // Layout is: left recursive output || left child digest
         //             || right child digest || right recursive output.
@@ -104,11 +111,12 @@ pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
         let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
         let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
         // Split `leaves` between both children.
-        let (left_leaves, right_leaves) = leaves.split_at(leaves.len() / 2);
+        let mid = (num_leaves / 2) * leaf_len;
+        let (left_leaves, right_leaves) = leaves.split_at(mid);
 
         let (left_digest, right_digest) = plonky2_maybe_rayon::join(
-            || fill_subtree::<F, H>(left_digests_buf, left_leaves),
-            || fill_subtree::<F, H>(right_digests_buf, right_leaves),
+            || fill_subtree::<F, H>(left_digests_buf, left_leaves, leaf_len),
+            || fill_subtree::<F, H>(right_digests_buf, right_leaves, leaf_len),
         );
 
         left_digest_mem.write(left_digest);
@@ -120,17 +128,19 @@ pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
 pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     cap_buf: &mut [MaybeUninit<H::Hash>],
-    leaves: &[Vec<F>],
+    leaves: &[F],
+    leaf_len: usize,
     cap_height: usize,
 ) {
+    let num_leaves = leaves.len() / leaf_len;
     // Special case of a tree that's all cap. The usual case will panic because we'll try to split
     // an empty slice into chunks of `0`. (We would not need this if there was a way to split into
     // `blah` chunks as opposed to chunks _of_ `blah`.)
     if digests_buf.is_empty() {
-        debug_assert_eq!(cap_buf.len(), leaves.len());
+        debug_assert_eq!(cap_buf.len(), num_leaves);
         cap_buf
             .par_iter_mut()
-            .zip(leaves)
+            .zip(leaves.par_chunks_exact(leaf_len))
             .for_each(|(cap_buf, leaf)| {
                 cap_buf.write(H::hash_or_noop(leaf));
             });
@@ -138,9 +148,10 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     }
 
     let subtree_digests_len = digests_buf.len() >> cap_height;
-    let subtree_leaves_len = leaves.len() >> cap_height;
+    let subtree_leaves_len = num_leaves >> cap_height;
+    let subtree_leaves_flat_len = subtree_leaves_len * leaf_len;
     let digests_chunks = digests_buf.par_chunks_exact_mut(subtree_digests_len);
-    let leaves_chunks = leaves.par_chunks_exact(subtree_leaves_len);
+    let leaves_chunks = leaves.par_chunks_exact(subtree_leaves_flat_len);
     assert_eq!(digests_chunks.len(), cap_buf.len());
     assert_eq!(digests_chunks.len(), leaves_chunks.len());
     digests_chunks.zip(cap_buf).zip(leaves_chunks).for_each(
@@ -148,7 +159,7 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
             // We have `1 << cap_height` sub-trees, one for each entry in `cap`. They are totally
             // independent, so we schedule one task for each. `digests_buf` and `leaves` are split
             // into `1 << cap_height` slices, one for each sub-tree.
-            subtree_cap.write(fill_subtree::<F, H>(subtree_digests, subtree_leaves));
+            subtree_cap.write(fill_subtree::<F, H>(subtree_digests, subtree_leaves, leaf_len));
         },
     );
 }
@@ -195,16 +206,20 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
 }
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
-    pub fn new(leaves: Vec<Vec<F>>, cap_height: usize) -> Self {
-        let log2_leaves_len = log2_strict(leaves.len());
+    /// Build a Merkle tree from flat contiguous leaf data.
+    /// `leaves` is a flat buffer where leaf `i` occupies `[i*leaf_len..(i+1)*leaf_len]`.
+    pub fn new_from_flat(leaves: Vec<F>, leaf_len: usize, cap_height: usize) -> Self {
+        let num_leaves = leaves.len() / leaf_len;
+        assert_eq!(leaves.len(), num_leaves * leaf_len, "leaves.len() must be a multiple of leaf_len");
+        let log2_leaves_len = log2_strict(num_leaves);
         assert!(
             cap_height <= log2_leaves_len,
-            "cap_height={} should be at most log2(leaves.len())={}",
+            "cap_height={} should be at most log2(num_leaves)={}",
             cap_height,
             log2_leaves_len
         );
 
-        let num_digests = 2 * (leaves.len() - (1 << cap_height));
+        let num_digests = 2 * (num_leaves - (1 << cap_height));
         let mut digests = Vec::with_capacity(num_digests);
 
         let len_cap = 1 << cap_height;
@@ -212,7 +227,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
         let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
         let cap_buf = capacity_up_to_mut(&mut cap, len_cap);
-        fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], cap_height);
+        fill_digests_buf::<F, H>(digests_buf, cap_buf, &leaves[..], leaf_len, cap_height);
 
         unsafe {
             // SAFETY: `fill_digests_buf` and `cap` initialized the spare capacity up to
@@ -223,20 +238,44 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
         Self {
             leaves,
+            leaf_len,
             digests,
             cap: MerkleCap(cap),
         }
     }
 
+    /// Build a Merkle tree from `Vec<Vec<F>>` (legacy interface).
+    /// Flattens the leaves into contiguous storage.
+    pub fn new(leaves_vecs: Vec<Vec<F>>, cap_height: usize) -> Self {
+        let leaf_len = leaves_vecs.first().map_or(0, |l| l.len());
+        let num_leaves = leaves_vecs.len();
+        let mut flat = Vec::with_capacity(num_leaves * leaf_len);
+        for leaf in &leaves_vecs {
+            debug_assert_eq!(leaf.len(), leaf_len, "All leaves must have the same length");
+            flat.extend_from_slice(leaf);
+        }
+        Self::new_from_flat(flat, leaf_len, cap_height)
+    }
+
+    /// Number of leaves in the tree.
+    pub fn num_leaves(&self) -> usize {
+        if self.leaf_len == 0 {
+            0
+        } else {
+            self.leaves.len() / self.leaf_len
+        }
+    }
+
     pub fn get(&self, i: usize) -> &[F] {
-        &self.leaves[i]
+        &self.leaves[i * self.leaf_len..(i + 1) * self.leaf_len]
     }
 
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
+        let num_leaves = self.num_leaves();
         let siblings =
-            merkle_tree_prove::<F, H>(leaf_index, self.leaves.len(), cap_height, &self.digests);
+            merkle_tree_prove::<F, H>(leaf_index, num_leaves, cap_height, &self.digests);
 
         MerkleProof { siblings }
     }

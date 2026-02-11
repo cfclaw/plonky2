@@ -1,13 +1,12 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use plonky2_field::extension::flatten;
 #[allow(unused_imports)]
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
 
-use crate::field::extension::{unflatten, Extendable};
+use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::prover::{fri_proof_of_work, FriCommitedTrees};
@@ -103,8 +102,19 @@ pub(crate) fn batch_fri_committed_trees<
         let arity = 1 << arity_bits;
 
         reverse_index_bits_in_place(&mut final_values.values);
-        let chunked_values = final_values.values.par_chunks(arity).map(flatten).collect();
-        let tree = MerkleTree::<F, C::Hasher>::new(chunked_values, fri_params.config.cap_height);
+        let leaf_len = arity * D;
+        let num_leaves = final_values.values.len() / arity;
+        let mut flat_leaves = vec![F::ZERO; num_leaves * leaf_len];
+        flat_leaves
+            .par_chunks_exact_mut(leaf_len)
+            .zip(final_values.values.par_chunks_exact(arity))
+            .for_each(|(out_leaf, in_chunk)| {
+                for (j, ext) in in_chunk.iter().enumerate() {
+                    let arr = ext.to_basefield_array();
+                    out_leaf[j * D..(j + 1) * D].copy_from_slice(&arr);
+                }
+            });
+        let tree = MerkleTree::<F, C::Hasher>::new_from_flat(flat_leaves, leaf_len, fri_params.config.cap_height);
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);

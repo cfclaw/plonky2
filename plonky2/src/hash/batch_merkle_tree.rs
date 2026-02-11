@@ -74,33 +74,36 @@ impl<F: RichField, H: Hasher<F>> BatchMerkleTree<F, H> {
 
             if cur_leaf_len == leaves_len {
                 // The bottom leaf layer
+                let leaf_len = cur[0].len();
+                let mut flat_leaves = Vec::with_capacity(cur_leaf_len * leaf_len);
+                for leaf in cur.iter() {
+                    flat_leaves.extend_from_slice(leaf);
+                }
                 cap = Vec::with_capacity(next_cap_len);
                 let tmp_cap_buf = capacity_up_to_mut(&mut cap, next_cap_len);
                 fill_digests_buf::<F, H>(
                     &mut digests_buf[digests_buf_pos..(digests_buf_pos + num_tmp_digests)],
                     tmp_cap_buf,
-                    &cur[..],
+                    &flat_leaves,
+                    leaf_len,
                     next_cap_height,
                 );
             } else {
                 // The rest leaf layers
-                let new_leaves: Vec<Vec<F>> = cap
-                    .iter()
-                    .enumerate()
-                    .map(|(i, cap_hash)| {
-                        let mut new_hash = Vec::with_capacity(NUM_HASH_OUT_ELTS + cur[i].len());
-                        new_hash.extend(&cap_hash.to_vec());
-                        new_hash.extend(&cur[i]);
-                        new_hash
-                    })
-                    .collect();
+                let new_leaf_len = NUM_HASH_OUT_ELTS + cur[0].len();
+                let mut flat_new_leaves = Vec::with_capacity(cap.len() * new_leaf_len);
+                for (i, cap_hash) in cap.iter().enumerate() {
+                    flat_new_leaves.extend_from_slice(&cap_hash.to_vec());
+                    flat_new_leaves.extend_from_slice(&cur[i]);
+                }
                 cap.clear();
                 cap.reserve_exact(next_cap_len);
                 let tmp_cap_buf = capacity_up_to_mut(&mut cap, next_cap_len);
                 fill_digests_buf::<F, H>(
                     &mut digests_buf[digests_buf_pos..(digests_buf_pos + num_tmp_digests)],
                     tmp_cap_buf,
-                    &new_leaves[..],
+                    &flat_new_leaves,
+                    new_leaf_len,
                     next_cap_height,
                 );
             }
