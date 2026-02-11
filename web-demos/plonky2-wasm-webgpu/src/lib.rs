@@ -253,6 +253,10 @@ where
     }
 }
 
+fn log(msg: &str) {
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(msg));
+}
+
 fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
     const D: usize = 2;
     type C = PoseidonGoldilocksWebGpuConfig;
@@ -261,26 +265,33 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
     let total_start = now_ms();
 
     // 1. Build inner circuit
+    log("[webgpu] 1/6 Building inner circuit...");
     let t = now_ms();
     let config = CircuitConfig::standard_recursion_config();
     let dummy_inner = DummyPsyTypeCCircuit::<F, C, D>::new(&config);
     let circuit_build_ms = now_ms() - t;
+    log(&format!("[webgpu] 1/6 Inner circuit built in {:.0}ms", circuit_build_ms));
 
     // 2. Generate inner proof 1
+    log("[webgpu] 2/6 Generating inner proof 1...");
     let t = now_ms();
     let dummy_proof_1 = dummy_inner
         .prove(HashOut::rand())
         .map_err(|e| format!("Inner proof 1 failed: {}", e))?;
     let inner_proof_1_ms = now_ms() - t;
+    log(&format!("[webgpu] 2/6 Inner proof 1 done in {:.0}ms", inner_proof_1_ms));
 
     // 3. Generate inner proof 2
+    log("[webgpu] 3/6 Generating inner proof 2...");
     let t = now_ms();
     let dummy_proof_2 = dummy_inner
         .prove(HashOut::rand())
         .map_err(|e| format!("Inner proof 2 failed: {}", e))?;
     let inner_proof_2_ms = now_ms() - t;
+    log(&format!("[webgpu] 3/6 Inner proof 2 done in {:.0}ms", inner_proof_2_ms));
 
     // 4. Build recursive circuit
+    log("[webgpu] 4/6 Building recursive circuit...");
     let t = now_ms();
     let dummy_recursive = DummyPsyTypeCRecursiveVerifierCircuit::<F, C, D>::new(
         &config,
@@ -292,8 +303,10 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
         &dummy_inner.circuit_data.common,
     );
     let recursive_circuit_build_ms = now_ms() - t;
+    log(&format!("[webgpu] 4/6 Recursive circuit built in {:.0}ms", recursive_circuit_build_ms));
 
     // 5. Generate recursive proof
+    log("[webgpu] 5/6 Generating recursive proof...");
     let t = now_ms();
     let recursive_proof = dummy_recursive
         .prove(
@@ -303,8 +316,10 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
         )
         .map_err(|e| format!("Recursive proof failed: {}", e))?;
     let recursive_proof_ms = now_ms() - t;
+    log(&format!("[webgpu] 5/6 Recursive proof done in {:.0}ms", recursive_proof_ms));
 
     // 6. Verify all proofs
+    log("[webgpu] 6/6 Verifying proofs...");
     let t = now_ms();
     dummy_inner
         .circuit_data
@@ -328,6 +343,7 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
         .map_err(|e| format!("Repeated verification failed: {}", e))?;
     }
     let verification_ms = now_ms() - t;
+    log(&format!("[webgpu] 6/6 Verification done in {:.0}ms", verification_ms));
 
     let total_ms = now_ms() - total_start;
 

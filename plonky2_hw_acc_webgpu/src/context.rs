@@ -28,17 +28,21 @@ impl WebGpuContext {
     /// Create a new WebGpuContext. This is async because GPU initialization is
     /// inherently async (adapter request, device request).
     pub async fn new_async() -> Result<Self> {
+        crate::log_msg("WebGpuContext::new_async() starting");
+
         let backends = if cfg!(target_arch = "wasm32") {
             wgpu::Backends::BROWSER_WEBGPU
         } else {
             wgpu::Backends::all()
         };
 
+        crate::log_msg("Creating wgpu instance");
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends,
             ..Default::default()
         });
 
+        crate::log_msg("Requesting adapter");
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
@@ -47,6 +51,7 @@ impl WebGpuContext {
         .await
         .ok_or_else(|| anyhow!("No suitable GPU adapter found"))?;
 
+        crate::log_msg("Adapter acquired, requesting device");
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("plonky2_webgpu"),
@@ -64,6 +69,8 @@ impl WebGpuContext {
         .await
         .map_err(|e| anyhow!("Failed to create WebGPU device: {}", e))?;
 
+        crate::log_msg("Device acquired");
+
         let mut ctx = Self {
             device,
             queue,
@@ -72,15 +79,24 @@ impl WebGpuContext {
         };
 
         // Compile FFT pipelines
+        crate::log_msg("Compiling pipeline: coset_scale_and_bit_reverse_batched");
         ctx.compile_pipeline("coset_scale_and_bit_reverse_batched", FFT_COSET_SCALE_WGSL)?;
+        crate::log_msg("Compiling pipeline: fft_dit_pass_batched");
         ctx.compile_pipeline("fft_dit_pass_batched", FFT_DIT_PASS_WGSL)?;
+        crate::log_msg("Compiling pipeline: bit_reverse_copy_batched");
         ctx.compile_pipeline("bit_reverse_copy_batched", BIT_REVERSE_COPY_WGSL)?;
+        crate::log_msg("Compiling pipeline: ifft_reorder_and_scale_batched");
         ctx.compile_pipeline("ifft_reorder_and_scale_batched", IFFT_REORDER_WGSL)?;
 
         // Compile Merkle pipelines
+        crate::log_msg("Compiling pipeline: copy_row_leaves");
         ctx.compile_pipeline("copy_row_leaves", MERKLE_WGSL)?;
+        crate::log_msg("Compiling pipeline: hash_row_leaves");
         ctx.compile_pipeline("hash_row_leaves", MERKLE_WGSL)?;
+        crate::log_msg("Compiling pipeline: compress_nodes");
         ctx.compile_pipeline("compress_nodes", MERKLE_WGSL)?;
+
+        crate::log_msg("All pipelines compiled, pre-computing twiddle factors");
 
         // Pre-compute twiddle factors in Montgomery form
         for log_n in 12..=(MAX_DEGREE_LOG + MAX_RATE_BITS) {
@@ -111,6 +127,7 @@ impl WebGpuContext {
             ctx.twiddle_buffers.insert(log_n, buffer);
         }
 
+        crate::log_msg("Twiddle factors done, context ready");
         Ok(ctx)
     }
 

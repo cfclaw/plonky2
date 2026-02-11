@@ -13,6 +13,14 @@ cd "$SCRIPT_DIR/plonky2-wasm-webgpu"
 wasm-pack build --target web --release
 
 echo ""
+echo "=== Copying WASM packages into React app ==="
+rm -rf "$SCRIPT_DIR/react-app/wasm-pkg"
+mkdir -p "$SCRIPT_DIR/react-app/wasm-pkg/plonky2-wasm-cpu"
+mkdir -p "$SCRIPT_DIR/react-app/wasm-pkg/plonky2-wasm-webgpu"
+cp "$SCRIPT_DIR/plonky2-wasm-cpu/pkg/"* "$SCRIPT_DIR/react-app/wasm-pkg/plonky2-wasm-cpu/"
+cp "$SCRIPT_DIR/plonky2-wasm-webgpu/pkg/"* "$SCRIPT_DIR/react-app/wasm-pkg/plonky2-wasm-webgpu/"
+
+echo ""
 echo "=== Installing React app dependencies ==="
 cd "$SCRIPT_DIR/react-app"
 npm install

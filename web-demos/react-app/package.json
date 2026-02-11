@@ -11,8 +11,8 @@
   "dependencies": {
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "plonky2-wasm-cpu": "file:../plonky2-wasm-cpu/pkg",
-    "plonky2-wasm-webgpu": "file:../plonky2-wasm-webgpu/pkg"
+    "plonky2-wasm-cpu": "file:./wasm-pkg/plonky2-wasm-cpu",
+    "plonky2-wasm-webgpu": "file:./wasm-pkg/plonky2-wasm-webgpu"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
