@@ -1,6 +1,18 @@
 use plonky2::field::goldilocks_field::GoldilocksField;
 use wgpu;
 
+/// Log to browser console on WASM, stderr on native.
+pub fn log_gpu(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::console::log_1(&msg.into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        eprintln!("{}", msg);
+    }
+}
+
 /// Create a GPU storage buffer (for compute shader read/write).
 pub fn create_storage_buffer(device: &wgpu::Device, size_bytes: u64, label: &str) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
@@ -91,17 +103,11 @@ pub fn download_field_data(
     device.poll(wgpu::Maintain::Wait);
     assert!(done.load(Ordering::SeqCst), "Buffer mapping did not complete");
 
-    // Copy bytes from the mapped range into owned memory, then reinterpret.
     let data = buffer_slice.get_mapped_range();
-    let bytes: &[u8] = &data;
-    let mut result = vec![GoldilocksField(0); num_elements];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            result.as_mut_ptr() as *mut u8,
-            bytes.len(),
-        );
-    }
+    let result: Vec<GoldilocksField> = unsafe {
+        let ptr = data.as_ptr() as *const GoldilocksField;
+        std::slice::from_raw_parts(ptr, num_elements).to_vec()
+    };
 
     drop(data);
     staging.unmap();
@@ -109,10 +115,11 @@ pub fn download_field_data(
     result
 }
 
-/// Async version of download_field_data.
-/// On WASM: chains a JS Promise to the map_async callback so we can properly
-/// await GPU completion without busy-polling.
-/// On native: uses device.poll(Wait) which blocks until the mapping completes.
+/// Async version of download_field_data for WASM.
+/// Uses wgpu::util::DownloadBuffer which handles staging/copy/map internally,
+/// and a futures_channel oneshot to convert the callback into an awaitable future.
+/// On WASM, .await properly yields to the browser event loop so the GPU
+/// mapAsync completion can fire.
 #[cfg(feature = "async_prover")]
 pub async fn download_field_data(
     device: &wgpu::Device,
@@ -122,50 +129,33 @@ pub async fn download_field_data(
 ) -> Vec<GoldilocksField> {
     let size_bytes = (num_elements * std::mem::size_of::<GoldilocksField>()) as u64;
 
-    let staging = create_staging_buffer_read(device, size_bytes, "download_staging");
+    log_gpu(&format!("  [gpu] download: {} elems ({} bytes)", num_elements, size_bytes));
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("download_encoder"),
-    });
-    encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size_bytes);
-    queue.submit(Some(encoder.finish()));
+    // Copy bytes out inside the callback so we only send Vec<u8> (which is
+    // Send) through the channel. DownloadBuffer itself is !Send on WASM
+    // because it contains JS types with raw pointers.
+    let (tx, rx) = futures_channel::oneshot::channel::<Vec<u8>>();
+    wgpu::util::DownloadBuffer::read_buffer(
+        device,
+        queue,
+        &src_buffer.slice(..size_bytes),
+        move |result| {
+            let download = result.unwrap();
+            let _ = tx.send(download.to_vec());
+        },
+    );
+    // On WASM, device.poll is a no-op — the browser drives the GPU.
+    // The .await on rx yields to the browser event loop, allowing the
+    // GPU mapAsync completion to fire and the callback to execute.
+    device.poll(wgpu::Maintain::Wait);
 
-    let buffer_slice = staging.slice(..);
+    let bytes = rx.await.unwrap();
+    let result: Vec<GoldilocksField> = unsafe {
+        let ptr = bytes.as_ptr() as *const GoldilocksField;
+        std::slice::from_raw_parts(ptr, num_elements).to_vec()
+    };
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        // Create a JS Promise that resolves when the GPU buffer mapping completes.
-        // This lets us properly yield to the browser event loop via .await instead
-        // of busy-polling with Promise.resolve().
-        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-                result.unwrap();
-                resolve.call0(&wasm_bindgen::JsValue::NULL).unwrap();
-            });
-        });
-        wasm_bindgen_futures::JsFuture::from(promise).await.unwrap();
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        buffer_slice.map_async(wgpu::MapMode::Read, |_| ());
-        device.poll(wgpu::Maintain::Wait);
-    }
-
-    // Copy bytes from the mapped range into WASM-owned memory, then reinterpret.
-    let data = buffer_slice.get_mapped_range();
-    let bytes: &[u8] = &data;
-    let mut result = vec![GoldilocksField(0); num_elements];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            result.as_mut_ptr() as *mut u8,
-            bytes.len(),
-        );
-    }
-
-    drop(data);
-    staging.unmap();
+    log_gpu("  [gpu] download: complete");
 
     result
 }
