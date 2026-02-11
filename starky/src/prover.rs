@@ -18,7 +18,7 @@ use plonky2::fri::reduction_strategies::FriReductionStrategy;
 use plonky2::fri::FriParams;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::challenger::Challenger;
-use plonky2::plonk::config::GenericConfig;
+use plonky2::plonk::config::{GenericConfig, ProverCompute};
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, log2_strict, transpose};
@@ -36,454 +36,447 @@ use crate::proof::{StarkOpeningSet, StarkProof, StarkProofWithPublicInputs};
 use crate::stark::Stark;
 use crate::vanishing_poly::{compute_eval_vanishing_poly, eval_vanishing_poly};
 
-/// From a STARK trace, computes a STARK proof to attest its correctness.
-pub fn prove<F, C, S, const D: usize>(
-    stark: S,
-    config: &StarkConfig,
-    trace_poly_values: Vec<PolynomialValues<F>>,
-    public_inputs: &[F],
-    verifier_circuit_fri_params: Option<FriParams>,
-    timing: &mut TimingTree,
-) -> Result<StarkProofWithPublicInputs<F, C, D>>
-where
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    S: Stark<F, D>,
-{
-    let degree = trace_poly_values[0].len();
-    let degree_bits = log2_strict(degree);
-    let fri_params = config.fri_params(degree_bits);
-    let rate_bits = config.fri_config.rate_bits;
-    let cap_height = config.fri_config.cap_height;
-    assert!(
-        fri_params.total_arities() <= degree_bits + rate_bits - cap_height,
-        "FRI total reduction arity is too large.",
-    );
-    let (final_poly_coeff_len, max_num_query_steps) =
-        if let Some(verifier_circuit_fri_params) = verifier_circuit_fri_params {
-            assert_eq!(verifier_circuit_fri_params.config, fri_params.config);
-            match &config.fri_config.reduction_strategy {
-                FriReductionStrategy::ConstantArityBits(_, final_poly_bits) => {
-                    let len = final_poly_coeff_len(
-                        verifier_circuit_fri_params.degree_bits,
-                        &verifier_circuit_fri_params.reduction_arity_bits,
-                    );
-                    assert_eq!(len, 1 << (1 + *final_poly_bits));
-                    (
-                        Some(len),
-                        Some(verifier_circuit_fri_params.reduction_arity_bits.len()),
-                    )
-                }
-                _ => panic!("Fri Reduction Strategy is not ConstantArityBits"),
-            }
-        } else {
-            (None, None)
-        };
-
-    let trace_commitment = timed!(
-        timing,
-        "compute trace commitment",
-        PolynomialBatch::<F, C, D>::from_values(
-            trace_poly_values.clone(),
-            rate_bits,
-            false,
-            cap_height,
-            timing,
-            None,
-        )?
-    );
-
-    let trace_cap = trace_commitment.merkle_tree.cap.clone();
-    let mut challenger = Challenger::new();
-    challenger.observe_elements(public_inputs);
-    config.observe(&mut challenger);
-    challenger.observe_cap(&trace_cap);
-    prove_with_commitment(
-        &stark,
-        config,
-        &trace_poly_values,
-        &trace_commitment,
-        None,
-        None,
-        &mut challenger,
-        public_inputs,
-        final_poly_coeff_len,
-        max_num_query_steps,
-        timing,
-    )
-}
-
-/// Generates a proof for a single STARK table, including:
-///
-/// - the initial state of the challenger,
-/// - all the required Merkle caps,
-/// - all the required polynomial and FRI argument openings.
-/// - individual `ctl_data` and common `ctl_challenges` if the STARK is part
-///   of a multi-STARK system.
-///
-/// /!\ Note that this method does not observe the `config`, and it assumes the `config` has already been observed.
-pub fn prove_with_commitment<F, C, S, const D: usize>(
-    stark: &S,
-    config: &StarkConfig,
-    trace_poly_values: &[PolynomialValues<F>],
-    trace_commitment: &PolynomialBatch<F, C, D>,
-    ctl_data: Option<&CtlData<F>>,
-    ctl_challenges: Option<&GrandProductChallengeSet<F>>,
-    challenger: &mut Challenger<F, C::Hasher>,
-    public_inputs: &[F],
-    final_poly_coeff_len: Option<usize>,
-    max_num_query_steps: Option<usize>,
-    timing: &mut TimingTree,
-) -> Result<StarkProofWithPublicInputs<F, C, D>>
-where
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    S: Stark<F, D>,
-{
-    let degree = trace_poly_values[0].len();
-    let degree_bits = log2_strict(degree);
-    let fri_params = config.fri_params(degree_bits);
-    let rate_bits = config.fri_config.rate_bits;
-    let cap_height = config.fri_config.cap_height;
-
-    let num_ctl_polys = ctl_data
-        .map(|data| data.num_ctl_helper_polys())
-        .unwrap_or_default();
-
-    assert!(
-        fri_params.total_arities() <= degree_bits + rate_bits - cap_height,
-        "FRI total reduction arity is too large.",
-    );
-
-    let constraint_degree = stark.constraint_degree();
-    assert!(
-        constraint_degree <= (1 << rate_bits) + 1,
-        "The degree of the Stark constraints must be <= blowup_factor + 1"
-    );
-
-    // Permutation arguments.
-    let lookup_challenges = stark.uses_lookups().then(|| {
-        if let Some(c) = ctl_challenges {
-            c.challenges.iter().map(|ch| ch.beta).collect::<Vec<_>>()
-        } else {
-            get_grand_product_challenge_set(challenger, config.num_challenges)
-                .challenges
-                .iter()
-                .map(|ch| ch.beta)
-                .collect::<Vec<_>>()
-        }
-    });
-
-    let lookups = stark.lookups();
-    let lookup_helper_columns = timed!(
-        timing,
-        "compute lookup helper columns",
-        lookup_challenges.as_ref().map(|challenges| {
-            let mut columns = Vec::new();
-            for lookup in &lookups {
-                for &challenge in challenges {
-                    columns.extend(lookup_helper_columns(
-                        lookup,
-                        trace_poly_values,
-                        challenge,
-                        constraint_degree,
-                    ));
-                }
-            }
-            columns
-        })
-    );
-    let num_lookup_columns = lookup_helper_columns.as_ref().map_or(0, |v| v.len());
-
-    // We add CTLs, if there are any, to the permutation arguments so that
-    // we can batch commit to all auxiliary polynomials.
-    let auxiliary_polys = match lookup_helper_columns {
-        None => get_ctl_auxiliary_polys(ctl_data),
-        Some(mut lookup_columns) => {
-            if let Some(p) = get_ctl_auxiliary_polys(ctl_data) {
-                lookup_columns.extend(p)
-            };
-
-            Some(lookup_columns)
-        }
-    };
-
-    debug_assert!(
-        (stark.uses_lookups() || stark.requires_ctls()) || auxiliary_polys.is_none(),
-        "There should be auxiliary polynomials if and only if we have either lookups or require cross-table lookups."
-    );
-
-    // Get the polynomial commitments for all auxiliary polynomials.
-    let auxiliary_polys_commitment = if let Some(aux_polys) = auxiliary_polys {
-        timed!(
-            timing,
-            "compute auxiliary polynomials commitment",
-            anyhow::Ok(Some(PolynomialBatch::from_values(
-                aux_polys,
-                rate_bits,
-                false,
-                config.fri_config.cap_height,
-                timing,
-                None,
-            )?))
-        )
-    } else {
-        Ok(None)
-    }?;
-
-    let auxiliary_polys_cap = auxiliary_polys_commitment
-        .as_ref()
-        .map(|commit| commit.merkle_tree.cap.clone());
-    if let Some(cap) = &auxiliary_polys_cap {
-        challenger.observe_cap(cap);
-    }
-
-    let alphas_prime = challenger.get_n_challenges(config.num_challenges);
-
-    // This is an expensive check, hence is only run when `debug_assertions` are enabled.
-    #[cfg(debug_assertions)]
-    {
-        check_constraints(
-            stark,
-            trace_commitment,
-            public_inputs,
-            &auxiliary_polys_commitment,
-            lookup_challenges.as_ref(),
-            &lookups,
-            ctl_data,
-            alphas_prime.clone(),
-            degree_bits,
-            num_lookup_columns,
-            &num_ctl_polys,
-        );
-    }
-
-    let g = F::primitive_root_of_unity(degree_bits);
-
-    // Before computing the quotient polynomial, we use grinding to "bind" the constraints with high probability.
-    // To do so, we get random challenges to represent the trace, auxiliary and CTL polynomials.
-    // We evaluate the constraints using those random values and combine them with `stark_alphas_prime`.
-    // Then, the challenger observes the resulting evaluations, so that the constraints are bound to `stark_alphas`
-    // (the challenges used in the quotient polynomials).
-    let is_aux_polys = auxiliary_polys_commitment.is_some();
-    let num_auxiliary_polys = auxiliary_polys_commitment
-        .as_ref()
-        .map_or(0, |p| p.polynomials.len());
-    let total_num_ctl_polys = num_ctl_polys.iter().sum::<usize>();
-
-    // Get the number of challenges we need to simulate the trace, auxiliary polynomials and CTL polynomials.
-    let total_num_dummy_extension_evals =
-        trace_commitment.polynomials.len() * 2 + num_auxiliary_polys * 2; // for auxiliary_polys and auxiliary_polys_next
-
-    // First power unreachable by the constraints.
-    let pow_degree = core::cmp::max(2, stark.constraint_degree() + 1);
-    let num_extension_powers = core::cmp::max(1, 50 / log2_ceil(pow_degree) - 1);
-
-    // Get extension field challenges that will simulate the trace, ctl, and auxiliary polynomials.
-    // Since sampling challenges for all polynomials might be heavy, we sample enough challenges {c_i}_i and use:
-    // c_i, c_i^{pow_degree}, ..., c_i^{pow_degree * 50} as simulated values.
-    let simulating_zetas = challenger
-        .get_n_extension_challenges(total_num_dummy_extension_evals.div_ceil(num_extension_powers));
-
-    // For each zeta in zetas, we compute the powers z^{(constraint_degree + 1)^i} for i = 0..num_extension_powers.
-    let nb_dummy_per_zeta =
-        core::cmp::min(num_extension_powers + 1, total_num_dummy_extension_evals);
-    let dummy_extension_evals = simulating_zetas
-        .iter()
-        .flat_map(|&zeta| {
-            successors(Some(zeta), move |prev| {
-                Some(prev.exp_u64(pow_degree as u64))
-            })
-            .take(nb_dummy_per_zeta)
-        })
-        .collect::<Vec<_>>();
-
-    // Simulate the opening set.
-    let next_values_start = S::COLUMNS;
-    let auxiliary_polys_start = S::COLUMNS * 2;
-    let auxiliary_polys_next_start = auxiliary_polys_start + num_auxiliary_polys;
-
-    let poly_evals = StarkOpeningSet {
-        local_values: dummy_extension_evals[..next_values_start].to_vec(),
-        next_values: dummy_extension_evals[next_values_start..auxiliary_polys_start].to_vec(),
-        auxiliary_polys: if is_aux_polys {
-            Some(dummy_extension_evals[auxiliary_polys_start..auxiliary_polys_next_start].to_vec())
-        } else {
-            None
-        },
-        auxiliary_polys_next: if is_aux_polys {
-            Some(dummy_extension_evals[auxiliary_polys_next_start..].to_vec())
-        } else {
-            None
-        },
-        ctl_zs_first: None,
-        quotient_polys: None,
-    };
-
-    // Get dummy ctl_vars.
-    let ctl_vars = ctl_data.map(|data| {
-        let mut start_index = 0;
-        data.zs_columns
-            .iter()
-            .enumerate()
-            .map(|(i, zs_columns)| {
-                let num_ctl_helper_cols = num_ctl_polys[i];
-                let helper_columns =
-                    poly_evals.auxiliary_polys.as_ref().unwrap()[num_lookup_columns + start_index
-                        ..num_lookup_columns + start_index + num_ctl_helper_cols]
-                        .to_vec();
-
-                let ctl_vars = CtlCheckVars::<F, F::Extension, F::Extension, D> {
-                    helper_columns,
-                    local_z: poly_evals.auxiliary_polys.as_ref().unwrap()
-                        [num_lookup_columns + total_num_ctl_polys + i],
-                    next_z: poly_evals.auxiliary_polys_next.as_ref().unwrap()
-                        [num_lookup_columns + total_num_ctl_polys + i],
-                    challenges: zs_columns.challenge,
-                    columns: zs_columns.columns.clone(),
-                    filter: zs_columns.filter.clone(),
+macro_rules! impl_stark_prove {
+    ($($async_kw:tt)*) => {
+        /// From a STARK trace, computes a STARK proof to attest its correctness.
+        pub $($async_kw)* fn prove<F, C, S, const D: usize>(
+            stark: S,
+            config: &StarkConfig,
+            trace_poly_values: Vec<PolynomialValues<F>>,
+            public_inputs: &[F],
+            verifier_circuit_fri_params: Option<FriParams>,
+            timing: &mut TimingTree,
+        ) -> Result<StarkProofWithPublicInputs<F, C, D>>
+        where
+            F: RichField + Extendable<D>,
+            C: GenericConfig<D, F = F>,
+            S: Stark<F, D>,
+        {
+            let degree = trace_poly_values[0].len();
+            let degree_bits = log2_strict(degree);
+            let fri_params = config.fri_params(degree_bits);
+            let rate_bits = config.fri_config.rate_bits;
+            let cap_height = config.fri_config.cap_height;
+            assert!(
+                fri_params.total_arities() <= degree_bits + rate_bits - cap_height,
+                "FRI total reduction arity is too large.",
+            );
+            let (final_poly_coeff_len, max_num_query_steps) =
+                if let Some(verifier_circuit_fri_params) = verifier_circuit_fri_params {
+                    assert_eq!(verifier_circuit_fri_params.config, fri_params.config);
+                    match &config.fri_config.reduction_strategy {
+                        FriReductionStrategy::ConstantArityBits(_, final_poly_bits) => {
+                            let len = final_poly_coeff_len(
+                                verifier_circuit_fri_params.degree_bits,
+                                &verifier_circuit_fri_params.reduction_arity_bits,
+                            );
+                            assert_eq!(len, 1 << (1 + *final_poly_bits));
+                            (
+                                Some(len),
+                                Some(verifier_circuit_fri_params.reduction_arity_bits.len()),
+                            )
+                        }
+                        _ => panic!("Fri Reduction Strategy is not ConstantArityBits"),
+                    }
+                } else {
+                    (None, None)
                 };
 
-                start_index += num_ctl_helper_cols;
-
-                ctl_vars
-            })
-            .collect::<Vec<_>>()
-    });
-
-    let zeta_prime = challenger.get_extension_challenge::<D>();
-
-    // Bind constraints.
-    let constraints = compute_eval_vanishing_poly::<F, S, D>(
-        stark,
-        &poly_evals,
-        ctl_vars.as_deref(),
-        lookup_challenges.as_ref(),
-        &lookups,
-        public_inputs,
-        alphas_prime.clone(),
-        zeta_prime,
-        degree_bits,
-        num_lookup_columns,
-    );
-
-    challenger.observe_extension_elements(&constraints);
-
-    let alphas = challenger.get_n_challenges(config.num_challenges);
-
-    let quotient_polys = timed!(
-        timing,
-        "compute quotient polys",
-        compute_quotient_polys::<F, <F as Packable>::Packing, C, S, D>(
-            stark,
-            trace_commitment,
-            &auxiliary_polys_commitment,
-            lookup_challenges.as_ref(),
-            &lookups,
-            ctl_data,
-            public_inputs,
-            alphas.clone(),
-            degree_bits,
-            num_lookup_columns,
-            &num_ctl_polys,
-            config,
-        )
-    );
-    let (quotient_commitment, quotient_polys_cap) = if let Some(quotient_polys) = quotient_polys {
-        let all_quotient_chunks = timed!(
-            timing,
-            "split quotient polys",
-            quotient_polys
-                .into_par_iter()
-                .flat_map(|mut quotient_poly| {
-                    quotient_poly
-                        .trim_to_len(degree * stark.quotient_degree_factor())
-                        .expect(
-                            "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                        );
-                    // Split quotient into degree-n chunks.
-                    quotient_poly.chunks(degree)
-                })
-                .collect()
-        );
-        // Commit to the quotient polynomials.
-        let quotient_commitment = timed!(
-            timing,
-            "compute quotient commitment",
-            PolynomialBatch::from_coeffs(
-                all_quotient_chunks,
-                rate_bits,
-                false,
-                config.fri_config.cap_height,
+            let trace_commitment = timed!(
                 timing,
+                "compute trace commitment",
+                plonky2::maybe_await!(C::Compute::compute_from_values(
+                    timing,
+                    trace_poly_values.clone(),
+                    rate_bits,
+                    false,
+                    cap_height,
+                    None,
+                ))?
+            );
+
+            let trace_cap = trace_commitment.merkle_tree.cap.clone();
+            let mut challenger = Challenger::new();
+            challenger.observe_elements(public_inputs);
+            config.observe(&mut challenger);
+            challenger.observe_cap(&trace_cap);
+            plonky2::maybe_await!(prove_with_commitment(
+                &stark,
+                config,
+                &trace_poly_values,
+                &trace_commitment,
                 None,
-            )?
-        );
-        // Observe the quotient polynomials Merkle cap.
-        let quotient_polys_cap = quotient_commitment.merkle_tree.cap.clone();
-        challenger.observe_cap(&quotient_polys_cap);
-        (Some(quotient_commitment), Some(quotient_polys_cap))
-    } else {
-        (None, None)
+                None,
+                &mut challenger,
+                public_inputs,
+                final_poly_coeff_len,
+                max_num_query_steps,
+                timing,
+            ))
+        }
     };
-
-    let zeta = challenger.get_extension_challenge::<D>();
-
-    // To avoid leaking witness data, we want to ensure that our opening locations, `zeta` and
-    // `g * zeta`, are not in our subgroup `H`. It suffices to check `zeta` only, since
-    // `(g * zeta)^n = zeta^n`, where `n` is the order of `g`.
-
-    ensure!(
-        zeta.exp_power_of_2(degree_bits) != F::Extension::ONE,
-        "Opening point is in the subgroup."
-    );
-
-    // Compute all openings: evaluate all committed polynomials at `zeta` and, when necessary, at `g * zeta`.
-    let openings = StarkOpeningSet::new(
-        zeta,
-        g,
-        trace_commitment,
-        auxiliary_polys_commitment.as_ref(),
-        quotient_commitment.as_ref(),
-        stark.num_lookup_helper_columns(config),
-        stark.requires_ctls(),
-        &num_ctl_polys,
-    );
-    // Get the FRI openings and observe them.
-    challenger.observe_openings(&openings.to_fri_openings());
-
-    let initial_merkle_trees = once(trace_commitment)
-        .chain(&auxiliary_polys_commitment)
-        .chain(&quotient_commitment)
-        .collect_vec();
-
-    let opening_proof = timed!(
-        timing,
-        "compute openings proof",
-        PolynomialBatch::prove_openings(
-            &stark.fri_instance(zeta, g, num_ctl_polys.iter().sum(), num_ctl_polys, config),
-            &initial_merkle_trees,
-            challenger,
-            &fri_params,
-            final_poly_coeff_len,
-            max_num_query_steps,
-            timing,
-        )
-    );
-
-    let proof = StarkProof {
-        trace_cap: trace_commitment.merkle_tree.cap.clone(),
-        auxiliary_polys_cap,
-        quotient_polys_cap,
-        openings,
-        opening_proof,
-    };
-
-    Ok(StarkProofWithPublicInputs {
-        proof,
-        public_inputs: public_inputs.to_vec(),
-    })
 }
+
+#[cfg(not(feature = "async_prover"))]
+impl_stark_prove!();
+
+#[cfg(feature = "async_prover")]
+impl_stark_prove!(async);
+
+macro_rules! impl_stark_prove_with_commitment {
+    ($($async_kw:tt)*) => {
+        /// Generates a proof for a single STARK table, including:
+        ///
+        /// - the initial state of the challenger,
+        /// - all the required Merkle caps,
+        /// - all the required polynomial and FRI argument openings.
+        /// - individual `ctl_data` and common `ctl_challenges` if the STARK is part
+        ///   of a multi-STARK system.
+        ///
+        /// /!\ Note that this method does not observe the `config`, and it assumes the `config` has already been observed.
+        pub $($async_kw)* fn prove_with_commitment<F, C, S, const D: usize>(
+            stark: &S,
+            config: &StarkConfig,
+            trace_poly_values: &[PolynomialValues<F>],
+            trace_commitment: &PolynomialBatch<F, C, D>,
+            ctl_data: Option<&CtlData<'_, F>>,
+            ctl_challenges: Option<&GrandProductChallengeSet<F>>,
+            challenger: &mut Challenger<F, C::Hasher>,
+            public_inputs: &[F],
+            final_poly_coeff_len: Option<usize>,
+            max_num_query_steps: Option<usize>,
+            timing: &mut TimingTree,
+        ) -> Result<StarkProofWithPublicInputs<F, C, D>>
+        where
+            F: RichField + Extendable<D>,
+            C: GenericConfig<D, F = F>,
+            S: Stark<F, D>,
+        {
+            let degree = trace_poly_values[0].len();
+            let degree_bits = log2_strict(degree);
+            let fri_params = config.fri_params(degree_bits);
+            let rate_bits = config.fri_config.rate_bits;
+            let cap_height = config.fri_config.cap_height;
+
+            let num_ctl_polys: Vec<usize> = ctl_data
+                .map(|data| data.num_ctl_helper_polys())
+                .unwrap_or_default();
+
+            assert!(
+                fri_params.total_arities() <= degree_bits + rate_bits - cap_height,
+                "FRI total reduction arity is too large.",
+            );
+
+            let constraint_degree = stark.constraint_degree();
+            assert!(
+                constraint_degree <= (1 << rate_bits) + 1,
+                "The degree of the Stark constraints must be <= blowup_factor + 1"
+            );
+
+            // Permutation arguments.
+            let lookup_challenges = stark.uses_lookups().then(|| {
+                if let Some(c) = ctl_challenges {
+                    c.challenges.iter().map(|ch| ch.beta).collect::<Vec<_>>()
+                } else {
+                    get_grand_product_challenge_set(challenger, config.num_challenges)
+                        .challenges
+                        .iter()
+                        .map(|ch| ch.beta)
+                        .collect::<Vec<_>>()
+                }
+            });
+
+            let lookups = stark.lookups();
+            let lookup_helper_columns = timed!(
+                timing,
+                "compute lookup helper columns",
+                lookup_challenges.as_ref().map(|challenges| {
+                    let mut columns = Vec::new();
+                    for lookup in &lookups {
+                        for &challenge in challenges {
+                            columns.extend(lookup_helper_columns(
+                                lookup,
+                                trace_poly_values,
+                                challenge,
+                                constraint_degree,
+                            ));
+                        }
+                    }
+                    columns
+                })
+            );
+            let num_lookup_columns = lookup_helper_columns.as_ref().map_or(0, |v| v.len());
+
+            let auxiliary_polys = match lookup_helper_columns {
+                None => get_ctl_auxiliary_polys(ctl_data),
+                Some(mut lookup_columns) => {
+                    if let Some(p) = get_ctl_auxiliary_polys(ctl_data) {
+                        lookup_columns.extend(p)
+                    };
+                    Some(lookup_columns)
+                }
+            };
+
+            debug_assert!(
+                (stark.uses_lookups() || stark.requires_ctls()) || auxiliary_polys.is_none(),
+                "There should be auxiliary polynomials if and only if we have either lookups or require cross-table lookups."
+            );
+
+            // Get the polynomial commitments for all auxiliary polynomials.
+            let auxiliary_polys_commitment = if let Some(aux_polys) = auxiliary_polys {
+                timed!(
+                    timing,
+                    "compute auxiliary polynomials commitment",
+                    anyhow::Ok(Some(plonky2::maybe_await!(C::Compute::compute_from_values(
+                        timing,
+                        aux_polys,
+                        rate_bits,
+                        false,
+                        config.fri_config.cap_height,
+                        None,
+                    ))?))
+                )
+            } else {
+                Ok(None)
+            }?;
+
+            let auxiliary_polys_cap = auxiliary_polys_commitment
+                .as_ref()
+                .map(|commit| commit.merkle_tree.cap.clone());
+            if let Some(cap) = &auxiliary_polys_cap {
+                challenger.observe_cap(cap);
+            }
+
+            let alphas_prime = challenger.get_n_challenges(config.num_challenges);
+
+            #[cfg(debug_assertions)]
+            {
+                check_constraints(
+                    stark,
+                    trace_commitment,
+                    public_inputs,
+                    &auxiliary_polys_commitment,
+                    lookup_challenges.as_ref(),
+                    &lookups,
+                    ctl_data,
+                    alphas_prime.clone(),
+                    degree_bits,
+                    num_lookup_columns,
+                    &num_ctl_polys,
+                );
+            }
+
+            let g = F::primitive_root_of_unity(degree_bits);
+
+            let is_aux_polys = auxiliary_polys_commitment.is_some();
+            let num_auxiliary_polys = auxiliary_polys_commitment
+                .as_ref()
+                .map_or(0, |p| p.polynomials.len());
+            let total_num_ctl_polys = num_ctl_polys.iter().sum::<usize>();
+
+            let total_num_dummy_extension_evals =
+                trace_commitment.polynomials.len() * 2 + num_auxiliary_polys * 2;
+
+            let pow_degree = core::cmp::max(2, stark.constraint_degree() + 1);
+            let num_extension_powers = core::cmp::max(1, 50 / log2_ceil(pow_degree) - 1);
+
+            let simulating_zetas = challenger
+                .get_n_extension_challenges(total_num_dummy_extension_evals.div_ceil(num_extension_powers));
+
+            let nb_dummy_per_zeta =
+                core::cmp::min(num_extension_powers + 1, total_num_dummy_extension_evals);
+            let dummy_extension_evals = simulating_zetas
+                .iter()
+                .flat_map(|&zeta| {
+                    successors(Some(zeta), move |prev| {
+                        Some(prev.exp_u64(pow_degree as u64))
+                    })
+                    .take(nb_dummy_per_zeta)
+                })
+                .collect::<Vec<_>>();
+
+            let next_values_start = S::COLUMNS;
+            let auxiliary_polys_start = S::COLUMNS * 2;
+            let auxiliary_polys_next_start = auxiliary_polys_start + num_auxiliary_polys;
+
+            let poly_evals = StarkOpeningSet {
+                local_values: dummy_extension_evals[..next_values_start].to_vec(),
+                next_values: dummy_extension_evals[next_values_start..auxiliary_polys_start].to_vec(),
+                auxiliary_polys: if is_aux_polys {
+                    Some(dummy_extension_evals[auxiliary_polys_start..auxiliary_polys_next_start].to_vec())
+                } else {
+                    None
+                },
+                auxiliary_polys_next: if is_aux_polys {
+                    Some(dummy_extension_evals[auxiliary_polys_next_start..].to_vec())
+                } else {
+                    None
+                },
+                ctl_zs_first: None,
+                quotient_polys: None,
+            };
+
+            let ctl_vars = ctl_data.map(|data| {
+                let mut start_index = 0;
+                data.zs_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, zs_columns)| {
+                        let num_ctl_helper_cols = num_ctl_polys[i];
+                        let helper_columns =
+                            poly_evals.auxiliary_polys.as_ref().unwrap()[num_lookup_columns + start_index
+                                ..num_lookup_columns + start_index + num_ctl_helper_cols]
+                                .to_vec();
+
+                        let ctl_vars = CtlCheckVars::<F, F::Extension, F::Extension, D> {
+                            helper_columns,
+                            local_z: poly_evals.auxiliary_polys.as_ref().unwrap()
+                                [num_lookup_columns + total_num_ctl_polys + i],
+                            next_z: poly_evals.auxiliary_polys_next.as_ref().unwrap()
+                                [num_lookup_columns + total_num_ctl_polys + i],
+                            challenges: zs_columns.challenge,
+                            columns: zs_columns.columns.clone(),
+                            filter: zs_columns.filter.clone(),
+                        };
+
+                        start_index += num_ctl_helper_cols;
+
+                        ctl_vars
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            let zeta_prime = challenger.get_extension_challenge::<D>();
+
+            let constraints = compute_eval_vanishing_poly::<F, S, D>(
+                stark,
+                &poly_evals,
+                ctl_vars.as_deref(),
+                lookup_challenges.as_ref(),
+                &lookups,
+                public_inputs,
+                alphas_prime.clone(),
+                zeta_prime,
+                degree_bits,
+                num_lookup_columns,
+            );
+
+            challenger.observe_extension_elements(&constraints);
+
+            let alphas = challenger.get_n_challenges(config.num_challenges);
+
+            let quotient_polys = timed!(
+                timing,
+                "compute quotient polys",
+                compute_quotient_polys::<F, <F as Packable>::Packing, C, S, D>(
+                    stark,
+                    trace_commitment,
+                    &auxiliary_polys_commitment,
+                    lookup_challenges.as_ref(),
+                    &lookups,
+                    ctl_data,
+                    public_inputs,
+                    alphas.clone(),
+                    degree_bits,
+                    num_lookup_columns,
+                    &num_ctl_polys,
+                    config,
+                )
+            );
+            let (quotient_commitment, quotient_polys_cap) = if let Some(quotient_polys) = quotient_polys {
+                let all_quotient_chunks = timed!(
+                    timing,
+                    "split quotient polys",
+                    quotient_polys
+                        .into_par_iter()
+                        .flat_map(|mut quotient_poly| {
+                            quotient_poly
+                                .trim_to_len(degree * stark.quotient_degree_factor())
+                                .expect(
+                                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                                );
+                            quotient_poly.chunks(degree)
+                        })
+                        .collect()
+                );
+                let quotient_commitment = timed!(
+                    timing,
+                    "compute quotient commitment",
+                    plonky2::maybe_await!(C::Compute::compute_from_coeffs(
+                        timing,
+                        all_quotient_chunks,
+                        config.fri_config.cap_height,
+                        rate_bits,
+                        false,
+                        None,
+                    ))?
+                );
+                let quotient_polys_cap = quotient_commitment.merkle_tree.cap.clone();
+                challenger.observe_cap(&quotient_polys_cap);
+                (Some(quotient_commitment), Some(quotient_polys_cap))
+            } else {
+                (None, None)
+            };
+
+            let zeta = challenger.get_extension_challenge::<D>();
+
+            ensure!(
+                zeta.exp_power_of_2(degree_bits) != F::Extension::ONE,
+                "Opening point is in the subgroup."
+            );
+
+            let openings = StarkOpeningSet::new(
+                zeta,
+                g,
+                trace_commitment,
+                auxiliary_polys_commitment.as_ref(),
+                quotient_commitment.as_ref(),
+                stark.num_lookup_helper_columns(config),
+                stark.requires_ctls(),
+                &num_ctl_polys,
+            );
+            challenger.observe_openings(&openings.to_fri_openings());
+
+            let initial_merkle_trees = once(trace_commitment)
+                .chain(&auxiliary_polys_commitment)
+                .chain(&quotient_commitment)
+                .collect_vec();
+
+            let opening_proof = timed!(
+                timing,
+                "compute openings proof",
+                PolynomialBatch::prove_openings(
+                    &stark.fri_instance(zeta, g, num_ctl_polys.iter().sum(), num_ctl_polys, config),
+                    &initial_merkle_trees,
+                    challenger,
+                    &fri_params,
+                    final_poly_coeff_len,
+                    max_num_query_steps,
+                    timing,
+                )
+            );
+
+            let proof = StarkProof {
+                trace_cap: trace_commitment.merkle_tree.cap.clone(),
+                auxiliary_polys_cap,
+                quotient_polys_cap,
+                openings,
+                opening_proof,
+            };
+
+            Ok(StarkProofWithPublicInputs {
+                proof,
+                public_inputs: public_inputs.to_vec(),
+            })
+        }
+    };
+}
+
+#[cfg(not(feature = "async_prover"))]
+impl_stark_prove_with_commitment!();
+
+#[cfg(feature = "async_prover")]
+impl_stark_prove_with_commitment!(async);
 
 /// Computes the quotient polynomials `(sum alpha^i C_i(x)) / Z_H(x)` for `alpha` in `alphas`,
 /// where the `C_i`s are the STARK constraints.

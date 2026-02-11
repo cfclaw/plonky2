@@ -16,12 +16,11 @@ use crate::fri::FriParams;
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{CpuProverCompute, GenericConfig};
 use crate::timed;
 use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::reverse_bits;
-use crate::plonk::config::ProverCompute;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
@@ -54,6 +53,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PolynomialBatch<F, C, D>
 {
     /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
+    /// Always uses the CPU implementation (sync). For GPU-accelerated computation in the prover,
+    /// call `C::Compute::compute_from_values` directly via `maybe_await!`.
     pub fn from_values(
         values: Vec<PolynomialValues<F>>,
         rate_bits: usize,
@@ -62,32 +63,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<Self> {
-        C::Compute::compute_from_values(
-            timing,
-            values,
-            rate_bits,
-            blinding,
-            cap_height,
-            fft_root_table,
+        CpuProverCompute::compute_from_values_cpu(
+            timing, values, rate_bits, blinding, cap_height, fft_root_table,
         )
-        /*
-        let coeffs = timed!(
-            timing,
-            "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
-        );
-
-        Self::from_coeffs(
-            coeffs,
-            rate_bits,
-            blinding,
-            cap_height,
-            timing,
-            fft_root_table,
-        )*/
     }
 
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
+    /// Always uses the CPU implementation (sync). For GPU-accelerated computation in the prover,
+    /// call `C::Compute::compute_from_coeffs` directly via `maybe_await!`.
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,
         rate_bits: usize,
@@ -96,13 +79,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<Self> {
-        C::Compute::compute_from_coeffs(
-            timing,
-            polynomials,
-            cap_height,
-            rate_bits,
-            blinding,
-            fft_root_table,
+        CpuProverCompute::compute_from_coeffs_cpu(
+            timing, polynomials, cap_height, rate_bits, blinding, fft_root_table,
         )
     }
 

@@ -158,7 +158,7 @@ where
         }
     }
 
-    fn prove(
+    async fn prove(
         &self,
         dummy_public_inputs: HashOut<F>,
     ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
@@ -170,7 +170,7 @@ where
             &self.circuit_data.common,
             pw,
             &mut timing,
-        )?;
+        ).await?;
         Ok(proof)
     }
 }
@@ -231,7 +231,7 @@ where
         }
     }
 
-    fn prove(
+    async fn prove(
         &self,
         left_proof: &ProofWithPublicInputs<F, C, D>,
         right_proof: &ProofWithPublicInputs<F, C, D>,
@@ -248,12 +248,12 @@ where
             &self.circuit_data.common,
             pw,
             &mut timing,
-        )?;
+        ).await?;
         Ok(proof)
     }
 }
 
-fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
+async fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
     const D: usize = 2;
     type C = PoseidonGoldilocksWebGpuConfig;
     type F = <C as GenericConfig<D>>::F;
@@ -270,6 +270,7 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
     let t = now_ms();
     let dummy_proof_1 = dummy_inner
         .prove(HashOut::rand())
+        .await
         .map_err(|e| format!("Inner proof 1 failed: {}", e))?;
     let inner_proof_1_ms = now_ms() - t;
 
@@ -277,6 +278,7 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
     let t = now_ms();
     let dummy_proof_2 = dummy_inner
         .prove(HashOut::rand())
+        .await
         .map_err(|e| format!("Inner proof 2 failed: {}", e))?;
     let inner_proof_2_ms = now_ms() - t;
 
@@ -301,6 +303,7 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
             &dummy_proof_2,
             &dummy_inner.circuit_data.verifier_only,
         )
+        .await
         .map_err(|e| format!("Recursive proof failed: {}", e))?;
     let recursive_proof_ms = now_ms() - t;
 
@@ -345,8 +348,8 @@ fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
 }
 
 #[wasm_bindgen]
-pub fn run_webgpu_benchmark() -> JsValue {
-    let result = match run_benchmark_inner() {
+pub async fn run_webgpu_benchmark() -> JsValue {
+    let result = match run_benchmark_inner().await {
         Ok(r) => r,
         Err(e) => BenchmarkResult {
             circuit_build_ms: 0.0,

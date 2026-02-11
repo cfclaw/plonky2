@@ -10,9 +10,9 @@ wasm-opt = false
 crate-type = ["cdylib"]
 
 [dependencies]
-plonky2 = { path = "../../plonky2", default-features = false, features = ["timing"] }
+plonky2 = { path = "../../plonky2", default-features = false, features = ["timing", "async_prover"] }
 plonky2_field = { path = "../../field", default-features = false }
-plonky2_hw_acc_webgpu = { path = "../../plonky2_hw_acc_webgpu", default-features = false }
+plonky2_hw_acc_webgpu = { path = "../../plonky2_hw_acc_webgpu", default-features = false, features = ["async_prover"] }
 plonky2_maybe_rayon = { path = "../../maybe_rayon", default-features = false }
 plonky2_util = { path = "../../util", default-features = false }
 

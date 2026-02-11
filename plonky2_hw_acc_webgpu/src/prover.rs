@@ -87,9 +87,6 @@ mod fft {
                 .copy_from_slice(bytemuck::bytes_of(&params));
             params_buffer.unmap();
 
-            // The twiddle buffer for this layer starts at twiddle_offset bytes
-            // We need a view of the twiddles starting at the right offset.
-            // wgpu bind groups support buffer offsets.
             let bind_group_layout = pipeline.get_bind_group_layout(0);
             let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("fft_dit_bg"),
@@ -125,302 +122,309 @@ mod fft {
         }
     }
 
-    /// Batch coset FFT: process all polynomials in a single GPU dispatch sequence.
-    pub fn run_gpu_coset_fft_batch(
-        ctx: &WebGpuContext,
-        all_coeffs: &[&[GoldilocksField]],
-        log_lde_size: usize,
-        shift: GoldilocksField,
-    ) -> Result<Vec<Vec<GoldilocksField>>> {
-        let num_polys = all_coeffs.len();
-        if num_polys == 0 {
-            return Ok(vec![]);
-        }
+    macro_rules! impl_fft_batch_functions {
+        ($($async_kw:tt)*) => {
+            /// Batch coset FFT: process all polynomials in a single GPU dispatch sequence.
+            pub $($async_kw)* fn run_gpu_coset_fft_batch(
+                ctx: &WebGpuContext,
+                all_coeffs: &[&[GoldilocksField]],
+                log_lde_size: usize,
+                shift: GoldilocksField,
+            ) -> Result<Vec<Vec<GoldilocksField>>> {
+                let num_polys = all_coeffs.len();
+                if num_polys == 0 {
+                    return Ok(vec![]);
+                }
 
-        let num_coeffs = all_coeffs[0].len();
-        let lde_size = 1 << log_lde_size;
+                let num_coeffs = all_coeffs[0].len();
+                let lde_size = 1 << log_lde_size;
 
-        // Pre-compute powers of shift in Montgomery form
-        let powers_of_shift: Vec<u64> = shift
-            .powers()
-            .take(num_coeffs)
-            .map(|f| utils::to_mont(f.0))
-            .collect();
-
-        // Convert all coefficients to Montgomery form and flatten
-        let mut src_mont: Vec<u64> = Vec::with_capacity(num_polys * num_coeffs);
-        for coeffs in all_coeffs {
-            for c in *coeffs {
-                src_mont.push(utils::to_mont(c.0));
-            }
-        }
-
-        // Create GPU buffers
-        let src_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fft_src"),
-            size: (src_mont.len() * 8) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
-        });
-        src_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-            unsafe { std::slice::from_raw_parts(src_mont.as_ptr() as *const u8, src_mont.len() * 8) }
-        );
-        src_buffer.unmap();
-
-        let dst_size = (num_polys * lde_size * 8) as u64;
-        let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "fft_dst");
-
-        let shifts_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fft_shifts"),
-            size: (powers_of_shift.len() * 8) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
-        });
-        shifts_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-            unsafe { std::slice::from_raw_parts(powers_of_shift.as_ptr() as *const u8, powers_of_shift.len() * 8) }
-        );
-        shifts_buffer.unmap();
-
-        let params = FftParams {
-            n: lde_size as u32,
-            log_n: log_lde_size as u32,
-            num_coeffs: num_coeffs as u32,
-            layer: 0,
-            stride: lde_size as u32,
-            n_inv_lo: 0,
-            n_inv_hi: 0,
-            twiddle_offset: 0,
-        };
-        let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fft_scale_params"),
-            size: std::mem::size_of::<FftParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
-        });
-        params_buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .copy_from_slice(bytemuck::bytes_of(&params));
-        params_buffer.unmap();
-
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("fft_coset_encoder"),
-        });
-
-        // Step 1: Coset scale + bit reverse
-        {
-            let pipeline = ctx.get_pipeline("coset_scale_and_bit_reverse_batched").unwrap();
-            let bind_group_layout = pipeline.get_bind_group_layout(0);
-            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("coset_scale_bg"),
-                layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: dst_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: src_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: shifts_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
-                ],
-            });
-
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("coset_scale_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, Some(&bind_group), &[]);
-            let wg_x = utils::div_ceil(lde_size as u32, 256);
-            pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
-            drop(pass);
-        }
-
-        // Step 2: Batched FFT passes
-        let twiddles = ctx.twiddle_buffers.get(&log_lde_size)
-            .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", log_lde_size))?;
-        encode_fft_passes_batched(
-            ctx, &mut encoder, &dst_buffer, log_lde_size, lde_size, num_polys, twiddles,
-        );
-
-        ctx.queue.submit(Some(encoder.finish()));
-
-        // Read back results and convert from Montgomery form
-        let all_mont = utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * lde_size);
-
-        // The downloaded data is raw u64 in GoldilocksField wrappers, but actually in Montgomery form.
-        // Convert back to standard form.
-        let results: Vec<Vec<GoldilocksField>> = (0..num_polys)
-            .into_par_iter()
-            .map(|i| {
-                let offset = i * lde_size;
-                all_mont[offset..offset + lde_size]
-                    .iter()
-                    .map(|f| GoldilocksField(utils::from_mont(f.0)))
-                    .collect()
-            })
-            .collect();
-
-        Ok(results)
-    }
-
-    /// Batch IFFT: process all polynomials in a single GPU dispatch sequence.
-    pub fn run_gpu_ifft_batch(
-        ctx: &WebGpuContext,
-        all_values: &[&[GoldilocksField]],
-    ) -> Result<Vec<PolynomialCoeffs<GoldilocksField>>> {
-        let num_polys = all_values.len();
-        if num_polys == 0 {
-            return Ok(vec![]);
-        }
-
-        let n = all_values[0].len();
-        let log_n = log2_strict(n);
-
-        // Convert all values to Montgomery form and flatten
-        let mut src_mont: Vec<u64> = Vec::with_capacity(num_polys * n);
-        for values in all_values {
-            for v in *values {
-                src_mont.push(utils::to_mont(v.0));
-            }
-        }
-
-        // Create GPU buffers
-        let src_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ifft_src"),
-            size: (src_mont.len() * 8) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
-        });
-        src_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-            unsafe { std::slice::from_raw_parts(src_mont.as_ptr() as *const u8, src_mont.len() * 8) }
-        );
-        src_buffer.unmap();
-
-        let dst_size = (num_polys * n * 8) as u64;
-        let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "ifft_dst");
-
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("ifft_encoder"),
-        });
-
-        // Step 1: Bit-reverse copy
-        {
-            let params = FftParams {
-                n: n as u32,
-                log_n: log_n as u32,
-                num_coeffs: 0,
-                layer: 0,
-                stride: n as u32,
-                n_inv_lo: 0,
-                n_inv_hi: 0,
-                twiddle_offset: 0,
-            };
-            let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("br_params"),
-                size: std::mem::size_of::<FftParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            });
-            params_buffer
-                .slice(..)
-                .get_mapped_range_mut()
-                .copy_from_slice(bytemuck::bytes_of(&params));
-            params_buffer.unmap();
-
-            let pipeline = ctx.get_pipeline("bit_reverse_copy_batched").unwrap();
-            let bind_group_layout = pipeline.get_bind_group_layout(0);
-            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("br_bg"),
-                layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: dst_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: src_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: params_buffer.as_entire_binding() },
-                ],
-            });
-
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("bit_reverse_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, Some(&bind_group), &[]);
-            let wg_x = utils::div_ceil(n as u32, 256);
-            pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
-            drop(pass);
-        }
-
-        // Step 2: FFT passes (forward twiddles)
-        let twiddles = ctx.twiddle_buffers.get(&log_n)
-            .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", log_n))?;
-        encode_fft_passes_batched(ctx, &mut encoder, &dst_buffer, log_n, n, num_polys, twiddles);
-
-        // Step 3: Reorder and scale
-        {
-            let n_inv = GoldilocksField::inverse_2exp(log_n);
-            let n_inv_mont = utils::to_mont(n_inv.0);
-
-            let params = FftParams {
-                n: n as u32,
-                log_n: log_n as u32,
-                num_coeffs: 0,
-                layer: 0,
-                stride: n as u32,
-                n_inv_lo: n_inv_mont as u32,
-                n_inv_hi: (n_inv_mont >> 32) as u32,
-                twiddle_offset: 0,
-            };
-            let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("ifft_reorder_params"),
-                size: std::mem::size_of::<FftParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            });
-            params_buffer
-                .slice(..)
-                .get_mapped_range_mut()
-                .copy_from_slice(bytemuck::bytes_of(&params));
-            params_buffer.unmap();
-
-            let pipeline = ctx.get_pipeline("ifft_reorder_and_scale_batched").unwrap();
-            let bind_group_layout = pipeline.get_bind_group_layout(0);
-            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("ifft_reorder_bg"),
-                layout: &bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: dst_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
-                ],
-            });
-
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ifft_reorder_pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, Some(&bind_group), &[]);
-            let wg_x = utils::div_ceil((n / 2) as u32, 256);
-            pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
-            drop(pass);
-        }
-
-        ctx.queue.submit(Some(encoder.finish()));
-
-        // Read back results and convert from Montgomery form
-        let all_mont = utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * n);
-
-        let results: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_polys)
-            .into_par_iter()
-            .map(|i| {
-                let offset = i * n;
-                let coeffs: Vec<GoldilocksField> = all_mont[offset..offset + n]
-                    .iter()
-                    .map(|f| GoldilocksField(utils::from_mont(f.0)))
+                let powers_of_shift: Vec<u64> = shift
+                    .powers()
+                    .take(num_coeffs)
+                    .map(|f| utils::to_mont(f.0))
                     .collect();
-                PolynomialCoeffs::new(coeffs)
-            })
-            .collect();
 
-        Ok(results)
+                let mut src_mont: Vec<u64> = Vec::with_capacity(num_polys * num_coeffs);
+                for coeffs in all_coeffs {
+                    for c in *coeffs {
+                        src_mont.push(utils::to_mont(c.0));
+                    }
+                }
+
+                let src_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fft_src"),
+                    size: (src_mont.len() * 8) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: true,
+                });
+                src_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
+                    unsafe { std::slice::from_raw_parts(src_mont.as_ptr() as *const u8, src_mont.len() * 8) }
+                );
+                src_buffer.unmap();
+
+                let dst_size = (num_polys * lde_size * 8) as u64;
+                let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "fft_dst");
+
+                let shifts_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fft_shifts"),
+                    size: (powers_of_shift.len() * 8) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: true,
+                });
+                shifts_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
+                    unsafe { std::slice::from_raw_parts(powers_of_shift.as_ptr() as *const u8, powers_of_shift.len() * 8) }
+                );
+                shifts_buffer.unmap();
+
+                let params = FftParams {
+                    n: lde_size as u32,
+                    log_n: log_lde_size as u32,
+                    num_coeffs: num_coeffs as u32,
+                    layer: 0,
+                    stride: lde_size as u32,
+                    n_inv_lo: 0,
+                    n_inv_hi: 0,
+                    twiddle_offset: 0,
+                };
+                let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("fft_scale_params"),
+                    size: std::mem::size_of::<FftParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: true,
+                });
+                params_buffer
+                    .slice(..)
+                    .get_mapped_range_mut()
+                    .copy_from_slice(bytemuck::bytes_of(&params));
+                params_buffer.unmap();
+
+                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("fft_coset_encoder"),
+                });
+
+                // Step 1: Coset scale + bit reverse
+                {
+                    let pipeline = ctx.get_pipeline("coset_scale_and_bit_reverse_batched").unwrap();
+                    let bind_group_layout = pipeline.get_bind_group_layout(0);
+                    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("coset_scale_bg"),
+                        layout: &bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: dst_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: src_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: shifts_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
+                        ],
+                    });
+
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("coset_scale_pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, Some(&bind_group), &[]);
+                    let wg_x = utils::div_ceil(lde_size as u32, 256);
+                    pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
+                    drop(pass);
+                }
+
+                // Step 2: Batched FFT passes
+                let twiddles = ctx.twiddle_buffers.get(&log_lde_size)
+                    .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", log_lde_size))?;
+                encode_fft_passes_batched(
+                    ctx, &mut encoder, &dst_buffer, log_lde_size, lde_size, num_polys, twiddles,
+                );
+
+                ctx.queue.submit(Some(encoder.finish()));
+
+                // Read back results and convert from Montgomery form
+                let all_mont = plonky2::maybe_await!(
+                    utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * lde_size)
+                );
+
+                let results: Vec<Vec<GoldilocksField>> = (0..num_polys)
+                    .into_par_iter()
+                    .map(|i| {
+                        let offset = i * lde_size;
+                        all_mont[offset..offset + lde_size]
+                            .iter()
+                            .map(|f| GoldilocksField(utils::from_mont(f.0)))
+                            .collect()
+                    })
+                    .collect();
+
+                Ok(results)
+            }
+
+            /// Batch IFFT: process all polynomials in a single GPU dispatch sequence.
+            pub $($async_kw)* fn run_gpu_ifft_batch(
+                ctx: &WebGpuContext,
+                all_values: &[&[GoldilocksField]],
+            ) -> Result<Vec<PolynomialCoeffs<GoldilocksField>>> {
+                let num_polys = all_values.len();
+                if num_polys == 0 {
+                    return Ok(vec![]);
+                }
+
+                let n = all_values[0].len();
+                let log_n = log2_strict(n);
+
+                let mut src_mont: Vec<u64> = Vec::with_capacity(num_polys * n);
+                for values in all_values {
+                    for v in *values {
+                        src_mont.push(utils::to_mont(v.0));
+                    }
+                }
+
+                let src_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ifft_src"),
+                    size: (src_mont.len() * 8) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: true,
+                });
+                src_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
+                    unsafe { std::slice::from_raw_parts(src_mont.as_ptr() as *const u8, src_mont.len() * 8) }
+                );
+                src_buffer.unmap();
+
+                let dst_size = (num_polys * n * 8) as u64;
+                let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "ifft_dst");
+
+                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("ifft_encoder"),
+                });
+
+                // Step 1: Bit-reverse copy
+                {
+                    let params = FftParams {
+                        n: n as u32,
+                        log_n: log_n as u32,
+                        num_coeffs: 0,
+                        layer: 0,
+                        stride: n as u32,
+                        n_inv_lo: 0,
+                        n_inv_hi: 0,
+                        twiddle_offset: 0,
+                    };
+                    let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("br_params"),
+                        size: std::mem::size_of::<FftParams>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: true,
+                    });
+                    params_buffer
+                        .slice(..)
+                        .get_mapped_range_mut()
+                        .copy_from_slice(bytemuck::bytes_of(&params));
+                    params_buffer.unmap();
+
+                    let pipeline = ctx.get_pipeline("bit_reverse_copy_batched").unwrap();
+                    let bind_group_layout = pipeline.get_bind_group_layout(0);
+                    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("br_bg"),
+                        layout: &bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: dst_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: src_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 2, resource: params_buffer.as_entire_binding() },
+                        ],
+                    });
+
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("bit_reverse_pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, Some(&bind_group), &[]);
+                    let wg_x = utils::div_ceil(n as u32, 256);
+                    pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
+                    drop(pass);
+                }
+
+                // Step 2: FFT passes (forward twiddles)
+                let twiddles = ctx.twiddle_buffers.get(&log_n)
+                    .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", log_n))?;
+                encode_fft_passes_batched(ctx, &mut encoder, &dst_buffer, log_n, n, num_polys, twiddles);
+
+                // Step 3: Reorder and scale
+                {
+                    let n_inv = GoldilocksField::inverse_2exp(log_n);
+                    let n_inv_mont = utils::to_mont(n_inv.0);
+
+                    let params = FftParams {
+                        n: n as u32,
+                        log_n: log_n as u32,
+                        num_coeffs: 0,
+                        layer: 0,
+                        stride: n as u32,
+                        n_inv_lo: n_inv_mont as u32,
+                        n_inv_hi: (n_inv_mont >> 32) as u32,
+                        twiddle_offset: 0,
+                    };
+                    let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("ifft_reorder_params"),
+                        size: std::mem::size_of::<FftParams>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: true,
+                    });
+                    params_buffer
+                        .slice(..)
+                        .get_mapped_range_mut()
+                        .copy_from_slice(bytemuck::bytes_of(&params));
+                    params_buffer.unmap();
+
+                    let pipeline = ctx.get_pipeline("ifft_reorder_and_scale_batched").unwrap();
+                    let bind_group_layout = pipeline.get_bind_group_layout(0);
+                    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("ifft_reorder_bg"),
+                        layout: &bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: dst_buffer.as_entire_binding() },
+                            wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
+                        ],
+                    });
+
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("ifft_reorder_pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, Some(&bind_group), &[]);
+                    let wg_x = utils::div_ceil((n / 2) as u32, 256);
+                    pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
+                    drop(pass);
+                }
+
+                ctx.queue.submit(Some(encoder.finish()));
+
+                // Read back results and convert from Montgomery form
+                let all_mont = plonky2::maybe_await!(
+                    utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * n)
+                );
+
+                let results: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_polys)
+                    .into_par_iter()
+                    .map(|i| {
+                        let offset = i * n;
+                        let coeffs: Vec<GoldilocksField> = all_mont[offset..offset + n]
+                            .iter()
+                            .map(|f| GoldilocksField(utils::from_mont(f.0)))
+                            .collect();
+                        PolynomialCoeffs::new(coeffs)
+                    })
+                    .collect();
+
+                Ok(results)
+            }
+        };
     }
+
+    #[cfg(not(feature = "async_prover"))]
+    impl_fft_batch_functions!();
+
+    #[cfg(feature = "async_prover")]
+    impl_fft_batch_functions!(async);
 }
 
 /// Params struct matching the WGSL MerkleParams layout (8 x u32 = 32 bytes)
@@ -456,429 +460,453 @@ type F = GoldilocksField;
 type C = PoseidonGoldilocksWebGpuConfig;
 const D: usize = 2;
 
-impl ProverCompute<F, C, D> for WebGpuProverCompute {
-    fn build_merkle_tree(
-        timing: &mut TimingTree,
-        leaves: Vec<Vec<F>>,
-        cap_height: usize,
-    ) -> anyhow::Result<MerkleTree<F, PoseidonHash>> {
-        let num_leaves = leaves.len();
-        if num_leaves == 0 {
-            return <CpuProverCompute as ProverCompute<F, C, D>>::build_merkle_tree(
-                timing, leaves, cap_height,
-            );
-        }
-
-        let log2_leaves = log2_strict(num_leaves);
-        let leaf_size = leaves[0].len();
-
-        // Fall back to CPU for very small trees
-        if log2_leaves < 4 || leaf_size == 0 {
-            return <CpuProverCompute as ProverCompute<F, C, D>>::build_merkle_tree(
-                timing, leaves, cap_height,
-            );
-        }
-
-        timed!(timing, "build Merkle tree (WebGPU)", {
-            let ctx_guard = crate::context::acquire_context()?;
-            let ctx = &*ctx_guard;
-
-            const HASH_SIZE: usize = 4; // NUM_HASH_OUT_ELTS
-
-            // Step 1: Upload flattened leaf data
-            let total_input_elems = num_leaves * leaf_size;
-            let input_bytes = (total_input_elems * 8) as u64;
-            let input_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("merkle_input"),
-                size: input_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            });
-            {
-                let mut mapped = input_buffer.slice(..).get_mapped_range_mut();
-                for (i, leaf) in leaves.iter().enumerate() {
-                    let offset = i * leaf_size * 8;
-                    let leaf_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            leaf.as_ptr() as *const u8,
-                            leaf_size * 8,
+macro_rules! impl_webgpu_prover_compute {
+    ($($async_kw:tt)*) => {
+        impl ProverCompute<F, C, D> for WebGpuProverCompute {
+            $($async_kw)* fn build_merkle_tree(
+                timing: &mut TimingTree,
+                leaves: Vec<Vec<F>>,
+                cap_height: usize,
+            ) -> anyhow::Result<MerkleTree<F, PoseidonHash>> {
+                let num_leaves = leaves.len();
+                if num_leaves == 0 {
+                    return plonky2::maybe_await!(
+                        <CpuProverCompute as ProverCompute<F, C, D>>::build_merkle_tree(
+                            timing, leaves, cap_height,
                         )
-                    };
-                    mapped[offset..offset + leaf_size * 8].copy_from_slice(leaf_bytes);
-                }
-            }
-            input_buffer.unmap();
-
-            // Step 2: Create ping/pong and tree buffers
-            let leaf_hash_bytes = (num_leaves * HASH_SIZE * 8) as u64;
-            let ping_buffer =
-                utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_ping");
-            let pong_buffer =
-                utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_pong");
-
-            let cap_len = 1usize << cap_height;
-            let num_digests = 2 * (num_leaves - cap_len);
-            let tree_bytes = (num_digests * HASH_SIZE * 8) as u64;
-            let tree_buffer = utils::create_storage_buffer(
-                &ctx.device,
-                tree_bytes.max(8),
-                "merkle_tree",
-            );
-
-            let mut encoder =
-                ctx.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("merkle_encoder"),
-                    });
-
-            // Step 3: Dispatch leaf hashing
-            let use_copy = leaf_size <= HASH_SIZE;
-            let pipeline_name = if use_copy {
-                "copy_row_leaves"
-            } else {
-                "hash_row_leaves"
-            };
-            let leaf_pipeline = ctx.get_pipeline(pipeline_name).unwrap();
-
-            let leaf_params = MerkleParams {
-                num_leaves: num_leaves as u32,
-                leaf_size: leaf_size as u32,
-                layer_idx: 0,
-                pairs_per_subtree: 0,
-                subtree_digest_len: 0,
-                _pad1: 0,
-                _pad2: 0,
-                _pad3: 0,
-            };
-            let leaf_params_buf = create_uniform_buffer(&ctx.device, &leaf_params);
-
-            {
-                let bind_group_layout = leaf_pipeline.get_bind_group_layout(0);
-                let bind_group =
-                    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("leaf_hash_bg"),
-                        layout: &bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: input_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: ping_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: leaf_params_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-
-                let mut pass =
-                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("leaf_hash_pass"),
-                        timestamp_writes: None,
-                    });
-                pass.set_pipeline(leaf_pipeline);
-                pass.set_bind_group(0, Some(&bind_group), &[]);
-                pass.dispatch_workgroups(
-                    utils::div_ceil(num_leaves as u32, 256),
-                    1,
-                    1,
-                );
-                drop(pass);
-            }
-
-            // Step 4: Compress layers (ping-pong)
-            let subtree_height = log2_leaves - cap_height;
-            let subtree_digest_len = if subtree_height > 0 {
-                2 * ((1usize << subtree_height) - 1)
-            } else {
-                0
-            };
-
-            let compress_pipeline = ctx.get_pipeline("compress_nodes").unwrap();
-            let mut current_pairs = num_leaves / 2;
-            let mut current_ping = &ping_buffer;
-            let mut current_pong = &pong_buffer;
-
-            for layer in 0..subtree_height {
-                let nodes_per_subtree = 1usize << (subtree_height - layer);
-                let pairs_per_subtree = nodes_per_subtree / 2;
-
-                let layer_params = MerkleParams {
-                    num_leaves: current_pairs as u32, // repurposed as num_pairs
-                    leaf_size: 0,
-                    layer_idx: layer as u32,
-                    pairs_per_subtree: pairs_per_subtree as u32,
-                    subtree_digest_len: subtree_digest_len as u32,
-                    _pad1: 0,
-                    _pad2: 0,
-                    _pad3: 0,
-                };
-                let layer_params_buf =
-                    create_uniform_buffer(&ctx.device, &layer_params);
-
-                let bind_group_layout = compress_pipeline.get_bind_group_layout(0);
-                let bind_group =
-                    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("compress_bg"),
-                        layout: &bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: current_ping.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: current_pong.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: layer_params_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: tree_buffer.as_entire_binding(),
-                            },
-                        ],
-                    });
-
-                let mut pass =
-                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("compress_pass"),
-                        timestamp_writes: None,
-                    });
-                pass.set_pipeline(compress_pipeline);
-                pass.set_bind_group(0, Some(&bind_group), &[]);
-                pass.dispatch_workgroups(
-                    utils::div_ceil(current_pairs as u32, 256),
-                    1,
-                    1,
-                );
-                drop(pass);
-
-                std::mem::swap(&mut current_ping, &mut current_pong);
-                current_pairs /= 2;
-            }
-
-            ctx.queue.submit(Some(encoder.finish()));
-
-            // Step 5: Read back results
-            // Tree digests
-            let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
-                let raw = utils::download_field_data(
-                    &ctx.device,
-                    &ctx.queue,
-                    &tree_buffer,
-                    num_digests * HASH_SIZE,
-                );
-                raw.chunks(HASH_SIZE)
-                    .map(|c| HashOut {
-                        elements: [c[0], c[1], c[2], c[3]],
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-
-            // Cap from current_ping (after all swaps)
-            let cap_raw = utils::download_field_data(
-                &ctx.device,
-                &ctx.queue,
-                current_ping,
-                cap_len * HASH_SIZE,
-            );
-            let cap_hashes: Vec<HashOut<F>> = cap_raw
-                .chunks(HASH_SIZE)
-                .map(|c| HashOut {
-                    elements: [c[0], c[1], c[2], c[3]],
-                })
-                .collect();
-
-            Ok(MerkleTree {
-                leaves,
-                digests: tree_digests,
-                cap: MerkleCap(cap_hashes),
-            })
-        })
-    }
-
-    fn compute_from_coeffs(
-        timing: &mut TimingTree,
-        polynomials: Vec<PolynomialCoeffs<F>>,
-        cap_height: usize,
-        rate_bits: usize,
-        blinding: bool,
-        fft_root_table: Option<&FftRootTable<F>>,
-    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        let degree = polynomials[0].len();
-        let degree_log = log2_strict(degree);
-        let lde_degree_log = degree_log + rate_bits;
-
-        // Fall back to CPU for sizes outside GPU twiddle range (12..=22)
-        if lde_degree_log < 12 || lde_degree_log > 22 {
-            return <CpuProverCompute as ProverCompute<F, C, D>>::compute_from_coeffs(
-                timing,
-                polynomials,
-                cap_height,
-                rate_bits,
-                blinding,
-                fft_root_table,
-            );
-        }
-
-        const SALT_SIZE: usize = 4;
-        let salt_size = if blinding { SALT_SIZE } else { 0 };
-
-        let lde_values: Vec<Vec<F>> = timed!(
-            timing,
-            "generate LDE values (WebGPU)",
-            {
-                let ctx_guard = crate::context::acquire_context()?;
-                let ctx = &*ctx_guard;
-
-                let coeff_slices: Vec<&[F]> =
-                    polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
-
-                let mut lde_values =
-                    fft::run_gpu_coset_fft_batch(ctx, &coeff_slices, lde_degree_log, F::coset_shift())?;
-
-                for _ in 0..salt_size {
-                    lde_values.push(F::rand_vec(1 << lde_degree_log));
-                }
-
-                lde_values
-            }
-        );
-
-        let mut leaves = transpose(&lde_values);
-        reverse_index_bits_in_place(&mut leaves);
-
-        let merkle_tree =
-            <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)?;
-
-        Ok(PolynomialBatch {
-            polynomials,
-            merkle_tree,
-            degree_log,
-            rate_bits,
-            blinding,
-        })
-    }
-
-    fn compute_from_values(
-        timing: &mut TimingTree,
-        values: Vec<PolynomialValues<F>>,
-        rate_bits: usize,
-        blinding: bool,
-        cap_height: usize,
-        fft_root_table: Option<&FftRootTable<F>>,
-    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        let degree_log = log2_strict(values[0].len());
-
-        if degree_log < 12 || degree_log + rate_bits > 22 {
-            return <CpuProverCompute as ProverCompute<F, C, D>>::compute_from_values(
-                timing, values, rate_bits, blinding, cap_height, fft_root_table,
-            );
-        }
-
-        let coeffs = timed!(
-            timing,
-            "IFFT (WebGPU)",
-            {
-                let ctx_guard = crate::context::acquire_context()?;
-                let ctx = &*ctx_guard;
-
-                let value_slices: Vec<&[GoldilocksField]> =
-                    values.iter().map(|v| v.values.as_slice()).collect();
-
-                fft::run_gpu_ifft_batch(ctx, &value_slices)?
-            }
-        );
-
-        Self::compute_from_coeffs(timing, coeffs, cap_height, rate_bits, blinding, fft_root_table)
-    }
-
-    fn transpose_and_compute_from_coeffs(
-        timing: &mut TimingTree,
-        pre_transposed_quotient_polys: Vec<Vec<F>>,
-        quotient_degree: usize,
-        degree: usize,
-        rate_bits: usize,
-        blinding: bool,
-        cap_height: usize,
-        fft_root_table: Option<&FftRootTable<F>>,
-    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        let ifft_log_n = log2_strict(pre_transposed_quotient_polys.len());
-        let degree_log = log2_strict(degree);
-
-        if ifft_log_n < 12 || ifft_log_n > 22 || degree_log + rate_bits > 22 {
-            return <CpuProverCompute as ProverCompute<F, C, D>>::transpose_and_compute_from_coeffs(
-                timing,
-                pre_transposed_quotient_polys,
-                quotient_degree,
-                degree,
-                rate_bits,
-                blinding,
-                cap_height,
-                fft_root_table,
-            );
-        }
-
-        let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
-            timing,
-            "coset IFFT quotient polys (WebGPU)",
-            {
-                let ctx_guard = crate::context::acquire_context()?;
-                let ctx = &*ctx_guard;
-
-                let transposed = transpose(&pre_transposed_quotient_polys);
-                let value_slices: Vec<&[GoldilocksField]> =
-                    transposed.iter().map(|v| v.as_slice()).collect();
-
-                let mut coeffs_batch = fft::run_gpu_ifft_batch(ctx, &value_slices)?;
-
-                // Apply coset shift inverse
-                let n = coeffs_batch[0].len();
-                let shift_inv = F::coset_shift().inverse();
-                let powers_of_shift_inv: Vec<_> = shift_inv.powers().take(n).collect();
-                coeffs_batch.par_iter_mut().for_each(|coeffs| {
-                    coeffs
-                        .coeffs
-                        .iter_mut()
-                        .zip(powers_of_shift_inv.iter())
-                        .for_each(|(c, s)| *c *= *s);
-                });
-
-                coeffs_batch
-            }
-        );
-
-        let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-            timing,
-            "split up quotient polys",
-            quotient_polys
-                .into_par_iter()
-                .flat_map(|mut quotient_poly| {
-                    quotient_poly.trim_to_len(quotient_degree).expect(
-                        "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
                     );
-                    quotient_poly.chunks(degree)
-                })
-                .collect()
-        );
+                }
 
-        Self::compute_from_coeffs(
-            timing,
-            all_quotient_poly_chunks,
-            cap_height,
-            rate_bits,
-            blinding,
-            fft_root_table,
-        )
-    }
+                let log2_leaves = log2_strict(num_leaves);
+                let leaf_size = leaves[0].len();
+
+                // Fall back to CPU for very small trees
+                if log2_leaves < 4 || leaf_size == 0 {
+                    return plonky2::maybe_await!(
+                        <CpuProverCompute as ProverCompute<F, C, D>>::build_merkle_tree(
+                            timing, leaves, cap_height,
+                        )
+                    );
+                }
+
+                timed!(timing, "build Merkle tree (WebGPU)", {
+                    let ctx_guard = crate::context::acquire_context()?;
+                    let ctx = &*ctx_guard;
+
+                    const HASH_SIZE: usize = 4; // NUM_HASH_OUT_ELTS
+
+                    // Step 1: Upload flattened leaf data
+                    let total_input_elems = num_leaves * leaf_size;
+                    let input_bytes = (total_input_elems * 8) as u64;
+                    let input_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("merkle_input"),
+                        size: input_bytes,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: true,
+                    });
+                    {
+                        let mut mapped = input_buffer.slice(..).get_mapped_range_mut();
+                        for (i, leaf) in leaves.iter().enumerate() {
+                            let offset = i * leaf_size * 8;
+                            let leaf_bytes: &[u8] = unsafe {
+                                std::slice::from_raw_parts(
+                                    leaf.as_ptr() as *const u8,
+                                    leaf_size * 8,
+                                )
+                            };
+                            mapped[offset..offset + leaf_size * 8].copy_from_slice(leaf_bytes);
+                        }
+                    }
+                    input_buffer.unmap();
+
+                    // Step 2: Create ping/pong and tree buffers
+                    let leaf_hash_bytes = (num_leaves * HASH_SIZE * 8) as u64;
+                    let ping_buffer =
+                        utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_ping");
+                    let pong_buffer =
+                        utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_pong");
+
+                    let cap_len = 1usize << cap_height;
+                    let num_digests = 2 * (num_leaves - cap_len);
+                    let tree_bytes = (num_digests * HASH_SIZE * 8) as u64;
+                    let tree_buffer = utils::create_storage_buffer(
+                        &ctx.device,
+                        tree_bytes.max(8),
+                        "merkle_tree",
+                    );
+
+                    let mut encoder =
+                        ctx.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("merkle_encoder"),
+                            });
+
+                    // Step 3: Dispatch leaf hashing
+                    let use_copy = leaf_size <= HASH_SIZE;
+                    let pipeline_name = if use_copy {
+                        "copy_row_leaves"
+                    } else {
+                        "hash_row_leaves"
+                    };
+                    let leaf_pipeline = ctx.get_pipeline(pipeline_name).unwrap();
+
+                    let leaf_params = MerkleParams {
+                        num_leaves: num_leaves as u32,
+                        leaf_size: leaf_size as u32,
+                        layer_idx: 0,
+                        pairs_per_subtree: 0,
+                        subtree_digest_len: 0,
+                        _pad1: 0,
+                        _pad2: 0,
+                        _pad3: 0,
+                    };
+                    let leaf_params_buf = create_uniform_buffer(&ctx.device, &leaf_params);
+
+                    {
+                        let bind_group_layout = leaf_pipeline.get_bind_group_layout(0);
+                        let bind_group =
+                            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("leaf_hash_bg"),
+                                layout: &bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: input_buffer.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: ping_buffer.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: leaf_params_buf.as_entire_binding(),
+                                    },
+                                ],
+                            });
+
+                        let mut pass =
+                            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("leaf_hash_pass"),
+                                timestamp_writes: None,
+                            });
+                        pass.set_pipeline(leaf_pipeline);
+                        pass.set_bind_group(0, Some(&bind_group), &[]);
+                        pass.dispatch_workgroups(
+                            utils::div_ceil(num_leaves as u32, 256),
+                            1,
+                            1,
+                        );
+                        drop(pass);
+                    }
+
+                    // Step 4: Compress layers (ping-pong)
+                    let subtree_height = log2_leaves - cap_height;
+                    let subtree_digest_len = if subtree_height > 0 {
+                        2 * ((1usize << subtree_height) - 1)
+                    } else {
+                        0
+                    };
+
+                    let compress_pipeline = ctx.get_pipeline("compress_nodes").unwrap();
+                    let mut current_pairs = num_leaves / 2;
+                    let mut current_ping = &ping_buffer;
+                    let mut current_pong = &pong_buffer;
+
+                    for layer in 0..subtree_height {
+                        let nodes_per_subtree = 1usize << (subtree_height - layer);
+                        let pairs_per_subtree = nodes_per_subtree / 2;
+
+                        let layer_params = MerkleParams {
+                            num_leaves: current_pairs as u32,
+                            leaf_size: 0,
+                            layer_idx: layer as u32,
+                            pairs_per_subtree: pairs_per_subtree as u32,
+                            subtree_digest_len: subtree_digest_len as u32,
+                            _pad1: 0,
+                            _pad2: 0,
+                            _pad3: 0,
+                        };
+                        let layer_params_buf =
+                            create_uniform_buffer(&ctx.device, &layer_params);
+
+                        let bind_group_layout = compress_pipeline.get_bind_group_layout(0);
+                        let bind_group =
+                            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("compress_bg"),
+                                layout: &bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: current_ping.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: current_pong.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: layer_params_buf.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: tree_buffer.as_entire_binding(),
+                                    },
+                                ],
+                            });
+
+                        let mut pass =
+                            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("compress_pass"),
+                                timestamp_writes: None,
+                            });
+                        pass.set_pipeline(compress_pipeline);
+                        pass.set_bind_group(0, Some(&bind_group), &[]);
+                        pass.dispatch_workgroups(
+                            utils::div_ceil(current_pairs as u32, 256),
+                            1,
+                            1,
+                        );
+                        drop(pass);
+
+                        std::mem::swap(&mut current_ping, &mut current_pong);
+                        current_pairs /= 2;
+                    }
+
+                    ctx.queue.submit(Some(encoder.finish()));
+
+                    // Step 5: Read back results
+                    let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
+                        let raw = plonky2::maybe_await!(utils::download_field_data(
+                            &ctx.device,
+                            &ctx.queue,
+                            &tree_buffer,
+                            num_digests * HASH_SIZE,
+                        ));
+                        raw.chunks(HASH_SIZE)
+                            .map(|c| HashOut {
+                                elements: [c[0], c[1], c[2], c[3]],
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    let cap_raw = plonky2::maybe_await!(utils::download_field_data(
+                        &ctx.device,
+                        &ctx.queue,
+                        current_ping,
+                        cap_len * HASH_SIZE,
+                    ));
+                    let cap_hashes: Vec<HashOut<F>> = cap_raw
+                        .chunks(HASH_SIZE)
+                        .map(|c| HashOut {
+                            elements: [c[0], c[1], c[2], c[3]],
+                        })
+                        .collect();
+
+                    Ok(MerkleTree {
+                        leaves,
+                        digests: tree_digests,
+                        cap: MerkleCap(cap_hashes),
+                    })
+                })
+            }
+
+            $($async_kw)* fn compute_from_coeffs(
+                timing: &mut TimingTree,
+                polynomials: Vec<PolynomialCoeffs<F>>,
+                cap_height: usize,
+                rate_bits: usize,
+                blinding: bool,
+                fft_root_table: Option<&FftRootTable<F>>,
+            ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+                let degree = polynomials[0].len();
+                let degree_log = log2_strict(degree);
+                let lde_degree_log = degree_log + rate_bits;
+
+                // Fall back to CPU for sizes outside GPU twiddle range (12..=22)
+                if lde_degree_log < 12 || lde_degree_log > 22 {
+                    return plonky2::maybe_await!(
+                        <CpuProverCompute as ProverCompute<F, C, D>>::compute_from_coeffs(
+                            timing,
+                            polynomials,
+                            cap_height,
+                            rate_bits,
+                            blinding,
+                            fft_root_table,
+                        )
+                    );
+                }
+
+                const SALT_SIZE: usize = 4;
+                let salt_size = if blinding { SALT_SIZE } else { 0 };
+
+                let lde_values: Vec<Vec<F>> = timed!(
+                    timing,
+                    "generate LDE values (WebGPU)",
+                    {
+                        let ctx_guard = crate::context::acquire_context()?;
+                        let ctx = &*ctx_guard;
+
+                        let coeff_slices: Vec<&[F]> =
+                            polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
+
+                        let mut lde_values = plonky2::maybe_await!(
+                            fft::run_gpu_coset_fft_batch(ctx, &coeff_slices, lde_degree_log, F::coset_shift())
+                        )?;
+
+                        for _ in 0..salt_size {
+                            lde_values.push(F::rand_vec(1 << lde_degree_log));
+                        }
+
+                        lde_values
+                    }
+                );
+
+                let mut leaves = transpose(&lde_values);
+                reverse_index_bits_in_place(&mut leaves);
+
+                let merkle_tree = plonky2::maybe_await!(
+                    <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)
+                )?;
+
+                Ok(PolynomialBatch {
+                    polynomials,
+                    merkle_tree,
+                    degree_log,
+                    rate_bits,
+                    blinding,
+                })
+            }
+
+            $($async_kw)* fn compute_from_values(
+                timing: &mut TimingTree,
+                values: Vec<PolynomialValues<F>>,
+                rate_bits: usize,
+                blinding: bool,
+                cap_height: usize,
+                fft_root_table: Option<&FftRootTable<F>>,
+            ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+                let degree_log = log2_strict(values[0].len());
+
+                if degree_log < 12 || degree_log + rate_bits > 22 {
+                    return plonky2::maybe_await!(
+                        <CpuProverCompute as ProverCompute<F, C, D>>::compute_from_values(
+                            timing, values, rate_bits, blinding, cap_height, fft_root_table,
+                        )
+                    );
+                }
+
+                let coeffs = timed!(
+                    timing,
+                    "IFFT (WebGPU)",
+                    {
+                        let ctx_guard = crate::context::acquire_context()?;
+                        let ctx = &*ctx_guard;
+
+                        let value_slices: Vec<&[GoldilocksField]> =
+                            values.iter().map(|v| v.values.as_slice()).collect();
+
+                        plonky2::maybe_await!(fft::run_gpu_ifft_batch(ctx, &value_slices))?
+                    }
+                );
+
+                plonky2::maybe_await!(Self::compute_from_coeffs(
+                    timing, coeffs, cap_height, rate_bits, blinding, fft_root_table
+                ))
+            }
+
+            $($async_kw)* fn transpose_and_compute_from_coeffs(
+                timing: &mut TimingTree,
+                pre_transposed_quotient_polys: Vec<Vec<F>>,
+                quotient_degree: usize,
+                degree: usize,
+                rate_bits: usize,
+                blinding: bool,
+                cap_height: usize,
+                fft_root_table: Option<&FftRootTable<F>>,
+            ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+                let ifft_log_n = log2_strict(pre_transposed_quotient_polys.len());
+                let degree_log = log2_strict(degree);
+
+                if ifft_log_n < 12 || ifft_log_n > 22 || degree_log + rate_bits > 22 {
+                    return plonky2::maybe_await!(
+                        <CpuProverCompute as ProverCompute<F, C, D>>::transpose_and_compute_from_coeffs(
+                            timing,
+                            pre_transposed_quotient_polys,
+                            quotient_degree,
+                            degree,
+                            rate_bits,
+                            blinding,
+                            cap_height,
+                            fft_root_table,
+                        )
+                    );
+                }
+
+                let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
+                    timing,
+                    "coset IFFT quotient polys (WebGPU)",
+                    {
+                        let ctx_guard = crate::context::acquire_context()?;
+                        let ctx = &*ctx_guard;
+
+                        let transposed = transpose(&pre_transposed_quotient_polys);
+                        let value_slices: Vec<&[GoldilocksField]> =
+                            transposed.iter().map(|v| v.as_slice()).collect();
+
+                        let mut coeffs_batch = plonky2::maybe_await!(
+                            fft::run_gpu_ifft_batch(ctx, &value_slices)
+                        )?;
+
+                        // Apply coset shift inverse
+                        let n = coeffs_batch[0].len();
+                        let shift_inv = F::coset_shift().inverse();
+                        let powers_of_shift_inv: Vec<_> = shift_inv.powers().take(n).collect();
+                        coeffs_batch.par_iter_mut().for_each(|coeffs| {
+                            coeffs
+                                .coeffs
+                                .iter_mut()
+                                .zip(powers_of_shift_inv.iter())
+                                .for_each(|(c, s)| *c *= *s);
+                        });
+
+                        coeffs_batch
+                    }
+                );
+
+                let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+                    timing,
+                    "split up quotient polys",
+                    quotient_polys
+                        .into_par_iter()
+                        .flat_map(|mut quotient_poly| {
+                            quotient_poly.trim_to_len(quotient_degree).expect(
+                                "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                            );
+                            quotient_poly.chunks(degree)
+                        })
+                        .collect()
+                );
+
+                plonky2::maybe_await!(Self::compute_from_coeffs(
+                    timing,
+                    all_quotient_poly_chunks,
+                    cap_height,
+                    rate_bits,
+                    blinding,
+                    fft_root_table,
+                ))
+            }
+        }
+    };
 }
+
+#[cfg(not(feature = "async_prover"))]
+impl_webgpu_prover_compute!();
+
+#[cfg(feature = "async_prover")]
+impl_webgpu_prover_compute!(async);
 
 #[cfg(test)]
 mod tests {
@@ -938,7 +966,6 @@ mod tests {
 
     #[test]
     fn test_mont_roundtrip() {
-        // Verify Montgomery form round-trip on CPU
         for _ in 0..1000 {
             let val = GoldilocksField::rand();
             let mont = utils::to_mont(val.0);

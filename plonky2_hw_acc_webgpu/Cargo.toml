@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = ["native"]
 native = ["dep:pollster", "dep:env_logger", "dep:parking_lot"]
+async_prover = ["plonky2/async_prover"]
 
 [dependencies]
 plonky2 = { path = "../plonky2", default-features = false, features = ["timing"] }

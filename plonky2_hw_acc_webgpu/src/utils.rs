@@ -60,7 +60,9 @@ pub fn upload_u64_data(
 /// This is a blocking operation that maps the buffer, reads, and unmaps.
 ///
 /// On native: uses std::sync::mpsc channel + device.poll(Wait).
-/// On WASM: wgpu's WebGPU backend handles poll(Wait) internally via microtask queue.
+/// On WASM without async_prover: wgpu's WebGPU backend processes the callback
+/// synchronously within poll(Wait) via the microtask queue.
+#[cfg(not(feature = "async_prover"))]
 pub fn download_field_data(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -79,9 +81,6 @@ pub fn download_field_data(
 
     let buffer_slice = staging.slice(..);
 
-    // On native, device.poll(Wait) blocks until the map callback fires.
-    // On WASM, wgpu's WebGPU backend processes the callback synchronously
-    // within poll(Wait) via the microtask queue.
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     let done = Arc::new(AtomicBool::new(false));
     let done_clone = done.clone();
@@ -91,6 +90,69 @@ pub fn download_field_data(
     });
     device.poll(wgpu::Maintain::Wait);
     assert!(done.load(Ordering::SeqCst), "Buffer mapping did not complete");
+
+    let data = buffer_slice.get_mapped_range();
+    let result: Vec<GoldilocksField> = unsafe {
+        let ptr = data.as_ptr() as *const GoldilocksField;
+        std::slice::from_raw_parts(ptr, num_elements).to_vec()
+    };
+
+    drop(data);
+    staging.unmap();
+
+    result
+}
+
+/// Async version of download_field_data for WASM.
+/// On WASM, device.poll(Wait) cannot synchronously block for the buffer
+/// mapping callback. This async version yields to the browser event loop
+/// via a resolved JS Promise, allowing the GPU mapping to complete.
+#[cfg(feature = "async_prover")]
+pub async fn download_field_data(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src_buffer: &wgpu::Buffer,
+    num_elements: usize,
+) -> Vec<GoldilocksField> {
+    let size_bytes = (num_elements * std::mem::size_of::<GoldilocksField>()) as u64;
+
+    let staging = create_staging_buffer_read(device, size_bytes, "download_staging");
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("download_encoder"),
+    });
+    encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size_bytes);
+    queue.submit(Some(encoder.finish()));
+
+    let buffer_slice = staging.slice(..);
+
+    // Use Arc<AtomicBool> for the completion flag (Send required on native).
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let done = Arc::new(AtomicBool::new(false));
+    let done_clone = done.clone();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        result.unwrap();
+        done_clone.store(true, Ordering::SeqCst);
+    });
+
+    // Yield to the browser event loop until the mapping completes.
+    // device.poll submits the request; the resolved promise yield lets
+    // the browser's microtask queue process the GPU callback.
+    while !done.load(Ordering::SeqCst) {
+        device.poll(wgpu::Maintain::Poll);
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::JsFuture::from(
+                js_sys::Promise::resolve(&wasm_bindgen::JsValue::NULL)
+            ).await.unwrap();
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // On native with async_prover, just poll with Wait (blocks).
+            device.poll(wgpu::Maintain::Wait);
+            break;
+        }
+    }
 
     let data = buffer_slice.get_mapped_range();
     let result: Vec<GoldilocksField> = unsafe {
