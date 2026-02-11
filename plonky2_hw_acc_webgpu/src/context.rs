@@ -1,6 +1,4 @@
 use anyhow::{anyhow, Result};
-use lazy_static::lazy_static;
-use parking_lot::Mutex;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use plonky2::field::ops::Square;
 use plonky2::field::types::Field;
@@ -27,33 +25,48 @@ pub struct WebGpuContext {
 }
 
 impl WebGpuContext {
-    pub fn new() -> Result<Self> {
+    /// Async constructor — works on both native and WASM.
+    pub async fn new_async() -> Result<Self> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
         });
 
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
-        }))
+        })
+        .await
         .ok_or_else(|| anyhow!("No suitable GPU adapter found"))?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
+        // Use conservative limits on WASM (browsers cap lower than native)
+        #[cfg(target_arch = "wasm32")]
+        let required_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: 256 << 20, // 256 MB
+            max_buffer_size: 256 << 20,
+            max_compute_workgroups_per_dimension: 65535,
+            ..wgpu::Limits::downlevel_defaults()
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let required_limits = wgpu::Limits {
+            max_storage_buffer_binding_size: 1 << 30, // 1 GB
+            max_buffer_size: 1 << 30,
+            max_compute_workgroups_per_dimension: 65535,
+            ..wgpu::Limits::default()
+        };
+
+        let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("plonky2_webgpu"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 1 << 30, // 1 GB
-                    max_buffer_size: 1 << 30,
-                    max_compute_workgroups_per_dimension: 65535,
-                    ..wgpu::Limits::default()
-                },
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
-        ))
+        )
+        .await
         .map_err(|e| anyhow!("Failed to create WebGPU device: {}", e))?;
 
         let mut ctx = Self {
@@ -106,6 +119,12 @@ impl WebGpuContext {
         Ok(ctx)
     }
 
+    /// Synchronous constructor — only available on native targets.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new() -> Result<Self> {
+        pollster::block_on(Self::new_async())
+    }
+
     fn compile_pipeline(&mut self, entry_point: &str, shader_source: &str) -> Result<()> {
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(entry_point),
@@ -155,18 +174,66 @@ fn fft_root_table_from_generator(
         .collect()
 }
 
-lazy_static! {
-    pub static ref WEBGPU_CONTEXT: Mutex<Option<WebGpuContext>> = {
-        match WebGpuContext::new() {
-            Ok(ctx) => Mutex::new(Some(ctx)),
-            Err(e) => {
-                println!("Failed to initialize WebGPU backend: {:?}", e);
-                Mutex::new(None)
+// ── Native context storage: lazy_static + parking_lot ──────────────────────
+#[cfg(not(target_arch = "wasm32"))]
+mod native_ctx {
+    use super::*;
+    use lazy_static::lazy_static;
+    use parking_lot::Mutex;
+
+    lazy_static! {
+        pub static ref WEBGPU_CONTEXT: Mutex<Option<WebGpuContext>> = {
+            match WebGpuContext::new() {
+                Ok(ctx) => Mutex::new(Some(ctx)),
+                Err(e) => {
+                    println!("Failed to initialize WebGPU backend: {:?}", e);
+                    Mutex::new(None)
+                }
             }
-        }
-    };
+        };
+    }
+
+    pub fn get_context<'a>() -> Option<parking_lot::MutexGuard<'a, Option<WebGpuContext>>> {
+        WEBGPU_CONTEXT.try_lock()
+    }
+
+    /// Unified context access — works identically on native and WASM.
+    pub fn with_context<R>(f: impl FnOnce(&WebGpuContext) -> R) -> Option<R> {
+        let guard = WEBGPU_CONTEXT.try_lock()?;
+        guard.as_ref().map(f)
+    }
 }
 
-pub fn get_context<'a>() -> Option<parking_lot::MutexGuard<'a, Option<WebGpuContext>>> {
-    WEBGPU_CONTEXT.try_lock()
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_ctx::{get_context, with_context};
+
+// ── WASM context storage: thread_local + RefCell ───────────────────────────
+#[cfg(target_arch = "wasm32")]
+mod wasm_ctx {
+    use super::*;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static WEBGPU_CONTEXT: RefCell<Option<WebGpuContext>> = RefCell::new(None);
+    }
+
+    /// Initialize the WebGPU context asynchronously. Must be called before proving.
+    pub async fn init_context() -> Result<()> {
+        let ctx = WebGpuContext::new_async().await?;
+        WEBGPU_CONTEXT.with(|cell| {
+            *cell.borrow_mut() = Some(ctx);
+        });
+        Ok(())
+    }
+
+    /// Unified context access — works identically on native and WASM.
+    pub fn with_context<R>(f: impl FnOnce(&WebGpuContext) -> R) -> Option<R> {
+        WEBGPU_CONTEXT.with(|cell| {
+            let borrow = cell.borrow();
+            borrow.as_ref().map(f)
+        })
+    }
 }
+
+#[cfg(target_arch = "wasm32")]
+pub use wasm_ctx::{init_context, with_context};

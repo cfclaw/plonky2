@@ -1,4 +1,4 @@
-use crate::context::{get_context, WebGpuContext};
+use crate::context::{with_context, WebGpuContext};
 use crate::utils;
 use anyhow::Result;
 use plonky2::field::extension::quadratic::QuadraticExtension;
@@ -17,6 +17,9 @@ use plonky2::util::{log2_strict, transpose};
 use plonky2_maybe_rayon::*;
 use plonky2_util::reverse_index_bits_in_place;
 use serde::Serialize;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::context::get_context;
 
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize)]
 pub struct PoseidonGoldilocksWebGpuConfig;
@@ -456,6 +459,236 @@ type F = GoldilocksField;
 type C = PoseidonGoldilocksWebGpuConfig;
 const D: usize = 2;
 
+/// Build a Merkle tree on the GPU given a context reference.
+fn build_merkle_tree_on_gpu(
+    ctx: &WebGpuContext,
+    leaves: Vec<Vec<F>>,
+    cap_height: usize,
+) -> anyhow::Result<MerkleTree<F, PoseidonHash>> {
+    let num_leaves = leaves.len();
+    let log2_leaves = log2_strict(num_leaves);
+    let leaf_size = leaves[0].len();
+
+    const HASH_SIZE: usize = 4; // NUM_HASH_OUT_ELTS
+
+    // Step 1: Upload flattened leaf data
+    let total_input_elems = num_leaves * leaf_size;
+    let input_bytes = (total_input_elems * 8) as u64;
+    let input_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("merkle_input"),
+        size: input_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    {
+        let mut mapped = input_buffer.slice(..).get_mapped_range_mut();
+        for (i, leaf) in leaves.iter().enumerate() {
+            let offset = i * leaf_size * 8;
+            let leaf_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    leaf.as_ptr() as *const u8,
+                    leaf_size * 8,
+                )
+            };
+            mapped[offset..offset + leaf_size * 8].copy_from_slice(leaf_bytes);
+        }
+    }
+    input_buffer.unmap();
+
+    // Step 2: Create ping/pong and tree buffers
+    let leaf_hash_bytes = (num_leaves * HASH_SIZE * 8) as u64;
+    let ping_buffer =
+        utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_ping");
+    let pong_buffer =
+        utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_pong");
+
+    let cap_len = 1usize << cap_height;
+    let num_digests = 2 * (num_leaves - cap_len);
+    let tree_bytes = (num_digests * HASH_SIZE * 8) as u64;
+    let tree_buffer = utils::create_storage_buffer(
+        &ctx.device,
+        tree_bytes.max(8),
+        "merkle_tree",
+    );
+
+    let mut encoder =
+        ctx.device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("merkle_encoder"),
+            });
+
+    // Step 3: Dispatch leaf hashing
+    let use_copy = leaf_size <= HASH_SIZE;
+    let pipeline_name = if use_copy {
+        "copy_row_leaves"
+    } else {
+        "hash_row_leaves"
+    };
+    let leaf_pipeline = ctx.get_pipeline(pipeline_name).unwrap();
+
+    let leaf_params = MerkleParams {
+        num_leaves: num_leaves as u32,
+        leaf_size: leaf_size as u32,
+        layer_idx: 0,
+        pairs_per_subtree: 0,
+        subtree_digest_len: 0,
+        _pad1: 0,
+        _pad2: 0,
+        _pad3: 0,
+    };
+    let leaf_params_buf = create_uniform_buffer(&ctx.device, &leaf_params);
+
+    {
+        let bind_group_layout = leaf_pipeline.get_bind_group_layout(0);
+        let bind_group =
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("leaf_hash_bg"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ping_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: leaf_params_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut pass =
+            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("leaf_hash_pass"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(leaf_pipeline);
+        pass.set_bind_group(0, Some(&bind_group), &[]);
+        pass.dispatch_workgroups(
+            utils::div_ceil(num_leaves as u32, 256),
+            1,
+            1,
+        );
+        drop(pass);
+    }
+
+    // Step 4: Compress layers (ping-pong)
+    let subtree_height = log2_leaves - cap_height;
+    let subtree_digest_len = if subtree_height > 0 {
+        2 * ((1usize << subtree_height) - 1)
+    } else {
+        0
+    };
+
+    let compress_pipeline = ctx.get_pipeline("compress_nodes").unwrap();
+    let mut current_pairs = num_leaves / 2;
+    let mut current_ping = &ping_buffer;
+    let mut current_pong = &pong_buffer;
+
+    for layer in 0..subtree_height {
+        let nodes_per_subtree = 1usize << (subtree_height - layer);
+        let pairs_per_subtree = nodes_per_subtree / 2;
+
+        let layer_params = MerkleParams {
+            num_leaves: current_pairs as u32, // repurposed as num_pairs
+            leaf_size: 0,
+            layer_idx: layer as u32,
+            pairs_per_subtree: pairs_per_subtree as u32,
+            subtree_digest_len: subtree_digest_len as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let layer_params_buf =
+            create_uniform_buffer(&ctx.device, &layer_params);
+
+        let bind_group_layout = compress_pipeline.get_bind_group_layout(0);
+        let bind_group =
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("compress_bg"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: current_ping.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: current_pong.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: layer_params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: tree_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let mut pass =
+            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("compress_pass"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(compress_pipeline);
+        pass.set_bind_group(0, Some(&bind_group), &[]);
+        pass.dispatch_workgroups(
+            utils::div_ceil(current_pairs as u32, 256),
+            1,
+            1,
+        );
+        drop(pass);
+
+        std::mem::swap(&mut current_ping, &mut current_pong);
+        current_pairs /= 2;
+    }
+
+    ctx.queue.submit(Some(encoder.finish()));
+
+    // Step 5: Read back results
+    // Tree digests
+    let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
+        let raw = utils::download_field_data(
+            &ctx.device,
+            &ctx.queue,
+            &tree_buffer,
+            num_digests * HASH_SIZE,
+        );
+        raw.chunks(HASH_SIZE)
+            .map(|c| HashOut {
+                elements: [c[0], c[1], c[2], c[3]],
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Cap from current_ping (after all swaps)
+    let cap_raw = utils::download_field_data(
+        &ctx.device,
+        &ctx.queue,
+        current_ping,
+        cap_len * HASH_SIZE,
+    );
+    let cap_hashes: Vec<HashOut<F>> = cap_raw
+        .chunks(HASH_SIZE)
+        .map(|c| HashOut {
+            elements: [c[0], c[1], c[2], c[3]],
+        })
+        .collect();
+
+    Ok(MerkleTree {
+        leaves,
+        digests: tree_digests,
+        cap: MerkleCap(cap_hashes),
+    })
+}
+
 impl ProverCompute<F, C, D> for WebGpuProverCompute {
     fn build_merkle_tree(
         timing: &mut TimingTree,
@@ -480,230 +713,10 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
         }
 
         timed!(timing, "build Merkle tree (WebGPU)", {
-            let guard =
-                get_context().ok_or_else(|| anyhow::anyhow!("WebGPU context locked"))?;
-            let ctx = guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("WebGPU context not initialized"))?;
-
-            const HASH_SIZE: usize = 4; // NUM_HASH_OUT_ELTS
-
-            // Step 1: Upload flattened leaf data
-            let total_input_elems = num_leaves * leaf_size;
-            let input_bytes = (total_input_elems * 8) as u64;
-            let input_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("merkle_input"),
-                size: input_bytes,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            });
-            {
-                let mut mapped = input_buffer.slice(..).get_mapped_range_mut();
-                for (i, leaf) in leaves.iter().enumerate() {
-                    let offset = i * leaf_size * 8;
-                    let leaf_bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            leaf.as_ptr() as *const u8,
-                            leaf_size * 8,
-                        )
-                    };
-                    mapped[offset..offset + leaf_size * 8].copy_from_slice(leaf_bytes);
-                }
-            }
-            input_buffer.unmap();
-
-            // Step 2: Create ping/pong and tree buffers
-            let leaf_hash_bytes = (num_leaves * HASH_SIZE * 8) as u64;
-            let ping_buffer =
-                utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_ping");
-            let pong_buffer =
-                utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_pong");
-
-            let cap_len = 1usize << cap_height;
-            let num_digests = 2 * (num_leaves - cap_len);
-            let tree_bytes = (num_digests * HASH_SIZE * 8) as u64;
-            let tree_buffer = utils::create_storage_buffer(
-                &ctx.device,
-                tree_bytes.max(8),
-                "merkle_tree",
-            );
-
-            let mut encoder =
-                ctx.device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("merkle_encoder"),
-                    });
-
-            // Step 3: Dispatch leaf hashing
-            let use_copy = leaf_size <= HASH_SIZE;
-            let pipeline_name = if use_copy {
-                "copy_row_leaves"
-            } else {
-                "hash_row_leaves"
-            };
-            let leaf_pipeline = ctx.get_pipeline(pipeline_name).unwrap();
-
-            let leaf_params = MerkleParams {
-                num_leaves: num_leaves as u32,
-                leaf_size: leaf_size as u32,
-                layer_idx: 0,
-                pairs_per_subtree: 0,
-                subtree_digest_len: 0,
-                _pad1: 0,
-                _pad2: 0,
-                _pad3: 0,
-            };
-            let leaf_params_buf = create_uniform_buffer(&ctx.device, &leaf_params);
-
-            {
-                let bind_group_layout = leaf_pipeline.get_bind_group_layout(0);
-                let bind_group =
-                    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("leaf_hash_bg"),
-                        layout: &bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: input_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: ping_buffer.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: leaf_params_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-
-                let mut pass =
-                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("leaf_hash_pass"),
-                        timestamp_writes: None,
-                    });
-                pass.set_pipeline(leaf_pipeline);
-                pass.set_bind_group(0, Some(&bind_group), &[]);
-                pass.dispatch_workgroups(
-                    utils::div_ceil(num_leaves as u32, 256),
-                    1,
-                    1,
-                );
-                drop(pass);
-            }
-
-            // Step 4: Compress layers (ping-pong)
-            let subtree_height = log2_leaves - cap_height;
-            let subtree_digest_len = if subtree_height > 0 {
-                2 * ((1usize << subtree_height) - 1)
-            } else {
-                0
-            };
-
-            let compress_pipeline = ctx.get_pipeline("compress_nodes").unwrap();
-            let mut current_pairs = num_leaves / 2;
-            let mut current_ping = &ping_buffer;
-            let mut current_pong = &pong_buffer;
-
-            for layer in 0..subtree_height {
-                let nodes_per_subtree = 1usize << (subtree_height - layer);
-                let pairs_per_subtree = nodes_per_subtree / 2;
-
-                let layer_params = MerkleParams {
-                    num_leaves: current_pairs as u32, // repurposed as num_pairs
-                    leaf_size: 0,
-                    layer_idx: layer as u32,
-                    pairs_per_subtree: pairs_per_subtree as u32,
-                    subtree_digest_len: subtree_digest_len as u32,
-                    _pad1: 0,
-                    _pad2: 0,
-                    _pad3: 0,
-                };
-                let layer_params_buf =
-                    create_uniform_buffer(&ctx.device, &layer_params);
-
-                let bind_group_layout = compress_pipeline.get_bind_group_layout(0);
-                let bind_group =
-                    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("compress_bg"),
-                        layout: &bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: current_ping.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: current_pong.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: layer_params_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: tree_buffer.as_entire_binding(),
-                            },
-                        ],
-                    });
-
-                let mut pass =
-                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("compress_pass"),
-                        timestamp_writes: None,
-                    });
-                pass.set_pipeline(compress_pipeline);
-                pass.set_bind_group(0, Some(&bind_group), &[]);
-                pass.dispatch_workgroups(
-                    utils::div_ceil(current_pairs as u32, 256),
-                    1,
-                    1,
-                );
-                drop(pass);
-
-                std::mem::swap(&mut current_ping, &mut current_pong);
-                current_pairs /= 2;
-            }
-
-            ctx.queue.submit(Some(encoder.finish()));
-
-            // Step 5: Read back results
-            // Tree digests
-            let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
-                let raw = utils::download_field_data(
-                    &ctx.device,
-                    &ctx.queue,
-                    &tree_buffer,
-                    num_digests * HASH_SIZE,
-                );
-                raw.chunks(HASH_SIZE)
-                    .map(|c| HashOut {
-                        elements: [c[0], c[1], c[2], c[3]],
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-
-            // Cap from current_ping (after all swaps)
-            let cap_raw = utils::download_field_data(
-                &ctx.device,
-                &ctx.queue,
-                current_ping,
-                cap_len * HASH_SIZE,
-            );
-            let cap_hashes: Vec<HashOut<F>> = cap_raw
-                .chunks(HASH_SIZE)
-                .map(|c| HashOut {
-                    elements: [c[0], c[1], c[2], c[3]],
-                })
-                .collect();
-
-            Ok(MerkleTree {
-                leaves,
-                digests: tree_digests,
-                cap: MerkleCap(cap_hashes),
+            with_context(|ctx| {
+                build_merkle_tree_on_gpu(ctx, leaves.clone(), cap_height)
             })
+            .ok_or_else(|| anyhow::anyhow!("WebGPU context not available"))?
         })
     }
 
@@ -738,22 +751,20 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
             timing,
             "generate LDE values (WebGPU)",
             {
-                let guard = get_context().ok_or(anyhow::anyhow!("WebGPU context locked"))?;
-                let ctx = guard
-                    .as_ref()
-                    .ok_or(anyhow::anyhow!("WebGPU context not initialized"))?;
+                with_context(|ctx| -> anyhow::Result<Vec<Vec<F>>> {
+                    let coeff_slices: Vec<&[F]> =
+                        polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
 
-                let coeff_slices: Vec<&[F]> =
-                    polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
+                    let mut lde_values =
+                        fft::run_gpu_coset_fft_batch(ctx, &coeff_slices, lde_degree_log, F::coset_shift())?;
 
-                let mut lde_values =
-                    fft::run_gpu_coset_fft_batch(ctx, &coeff_slices, lde_degree_log, F::coset_shift())?;
+                    for _ in 0..salt_size {
+                        lde_values.push(F::rand_vec(1 << lde_degree_log));
+                    }
 
-                for _ in 0..salt_size {
-                    lde_values.push(F::rand_vec(1 << lde_degree_log));
-                }
-
-                lde_values
+                    Ok(lde_values)
+                })
+                .ok_or_else(|| anyhow::anyhow!("WebGPU context not available"))??
             }
         );
 
@@ -792,15 +803,13 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
             timing,
             "IFFT (WebGPU)",
             {
-                let guard = get_context().ok_or(anyhow::anyhow!("WebGPU context locked"))?;
-                let ctx = guard
-                    .as_ref()
-                    .ok_or(anyhow::anyhow!("WebGPU context not initialized"))?;
+                with_context(|ctx| -> anyhow::Result<Vec<PolynomialCoeffs<F>>> {
+                    let value_slices: Vec<&[GoldilocksField]> =
+                        values.iter().map(|v| v.values.as_slice()).collect();
 
-                let value_slices: Vec<&[GoldilocksField]> =
-                    values.iter().map(|v| v.values.as_slice()).collect();
-
-                fft::run_gpu_ifft_batch(ctx, &value_slices)?
+                    fft::run_gpu_ifft_batch(ctx, &value_slices)
+                })
+                .ok_or_else(|| anyhow::anyhow!("WebGPU context not available"))??
             }
         );
 
@@ -837,30 +846,28 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
             timing,
             "coset IFFT quotient polys (WebGPU)",
             {
-                let guard = get_context().ok_or(anyhow::anyhow!("WebGPU context locked"))?;
-                let ctx = guard
-                    .as_ref()
-                    .ok_or(anyhow::anyhow!("WebGPU context not initialized"))?;
+                with_context(|ctx| -> anyhow::Result<Vec<PolynomialCoeffs<F>>> {
+                    let transposed = transpose(&pre_transposed_quotient_polys);
+                    let value_slices: Vec<&[GoldilocksField]> =
+                        transposed.iter().map(|v| v.as_slice()).collect();
 
-                let transposed = transpose(&pre_transposed_quotient_polys);
-                let value_slices: Vec<&[GoldilocksField]> =
-                    transposed.iter().map(|v| v.as_slice()).collect();
+                    let mut coeffs_batch = fft::run_gpu_ifft_batch(ctx, &value_slices)?;
 
-                let mut coeffs_batch = fft::run_gpu_ifft_batch(ctx, &value_slices)?;
+                    // Apply coset shift inverse
+                    let n = coeffs_batch[0].len();
+                    let shift_inv = F::coset_shift().inverse();
+                    let powers_of_shift_inv: Vec<_> = shift_inv.powers().take(n).collect();
+                    coeffs_batch.par_iter_mut().for_each(|coeffs| {
+                        coeffs
+                            .coeffs
+                            .iter_mut()
+                            .zip(powers_of_shift_inv.iter())
+                            .for_each(|(c, s)| *c *= *s);
+                    });
 
-                // Apply coset shift inverse
-                let n = coeffs_batch[0].len();
-                let shift_inv = F::coset_shift().inverse();
-                let powers_of_shift_inv: Vec<_> = shift_inv.powers().take(n).collect();
-                coeffs_batch.par_iter_mut().for_each(|coeffs| {
-                    coeffs
-                        .coeffs
-                        .iter_mut()
-                        .zip(powers_of_shift_inv.iter())
-                        .for_each(|(c, s)| *c *= *s);
-                });
-
-                coeffs_batch
+                    Ok(coeffs_batch)
+                })
+                .ok_or_else(|| anyhow::anyhow!("WebGPU context not available"))??
             }
         );
 
@@ -892,6 +899,9 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    use crate::context::get_context;
     use plonky2::field::types::Sample;
 
     #[test]

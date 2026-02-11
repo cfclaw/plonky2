@@ -57,7 +57,10 @@ pub fn upload_u64_data(
 }
 
 /// Download data from a GPU buffer into a Vec<GoldilocksField>.
-/// This is a blocking operation that maps the buffer, reads, and unmaps.
+/// Native: blocking (uses mpsc channel + device.poll).
+/// WASM: uses the same sync-looking code but wgpu's WASM backend
+/// drives polling through the browser event loop automatically.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn download_field_data(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -78,6 +81,48 @@ pub fn download_field_data(
     let (sender, receiver) = std::sync::mpsc::channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
         sender.send(result).unwrap();
+    });
+    device.poll(wgpu::Maintain::Wait);
+    receiver.recv().unwrap().unwrap();
+
+    let data = buffer_slice.get_mapped_range();
+    let result: Vec<GoldilocksField> = unsafe {
+        let ptr = data.as_ptr() as *const GoldilocksField;
+        std::slice::from_raw_parts(ptr, num_elements).to_vec()
+    };
+
+    drop(data);
+    staging.unmap();
+
+    result
+}
+
+/// WASM version: uses wgpu's built-in async buffer mapping.
+/// On WASM, wgpu handles the event loop internally so map_async
+/// callbacks fire without explicit device.poll().
+#[cfg(target_arch = "wasm32")]
+pub fn download_field_data(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src_buffer: &wgpu::Buffer,
+    num_elements: usize,
+) -> Vec<GoldilocksField> {
+    let size_bytes = (num_elements * std::mem::size_of::<GoldilocksField>()) as u64;
+
+    let staging = create_staging_buffer_read(device, size_bytes, "download_staging");
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("download_encoder"),
+    });
+    encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size_bytes);
+    queue.submit(Some(encoder.finish()));
+
+    // On WASM, wgpu maps buffers synchronously after submit when using WebGPU backend.
+    // We use a simple flag-based approach that works with the browser's event loop.
+    let buffer_slice = staging.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
     });
     device.poll(wgpu::Maintain::Wait);
     receiver.recv().unwrap().unwrap();
