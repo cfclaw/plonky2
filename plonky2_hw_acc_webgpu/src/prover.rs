@@ -1,4 +1,4 @@
-use crate::context::{get_context, WebGpuContext};
+use crate::context::WebGpuContext;
 use crate::utils;
 use anyhow::Result;
 use plonky2::field::extension::quadratic::QuadraticExtension;
@@ -480,11 +480,8 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
         }
 
         timed!(timing, "build Merkle tree (WebGPU)", {
-            let guard =
-                get_context().ok_or_else(|| anyhow::anyhow!("WebGPU context locked"))?;
-            let ctx = guard
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("WebGPU context not initialized"))?;
+            let ctx_guard = crate::context::acquire_context()?;
+            let ctx = &*ctx_guard;
 
             const HASH_SIZE: usize = 4; // NUM_HASH_OUT_ELTS
 
@@ -738,10 +735,8 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
             timing,
             "generate LDE values (WebGPU)",
             {
-                let guard = get_context().ok_or(anyhow::anyhow!("WebGPU context locked"))?;
-                let ctx = guard
-                    .as_ref()
-                    .ok_or(anyhow::anyhow!("WebGPU context not initialized"))?;
+                let ctx_guard = crate::context::acquire_context()?;
+                let ctx = &*ctx_guard;
 
                 let coeff_slices: Vec<&[F]> =
                     polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
@@ -792,10 +787,8 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
             timing,
             "IFFT (WebGPU)",
             {
-                let guard = get_context().ok_or(anyhow::anyhow!("WebGPU context locked"))?;
-                let ctx = guard
-                    .as_ref()
-                    .ok_or(anyhow::anyhow!("WebGPU context not initialized"))?;
+                let ctx_guard = crate::context::acquire_context()?;
+                let ctx = &*ctx_guard;
 
                 let value_slices: Vec<&[GoldilocksField]> =
                     values.iter().map(|v| v.values.as_slice()).collect();
@@ -837,10 +830,8 @@ impl ProverCompute<F, C, D> for WebGpuProverCompute {
             timing,
             "coset IFFT quotient polys (WebGPU)",
             {
-                let guard = get_context().ok_or(anyhow::anyhow!("WebGPU context locked"))?;
-                let ctx = guard
-                    .as_ref()
-                    .ok_or(anyhow::anyhow!("WebGPU context not initialized"))?;
+                let ctx_guard = crate::context::acquire_context()?;
+                let ctx = &*ctx_guard;
 
                 let transposed = transpose(&pre_transposed_quotient_polys);
                 let value_slices: Vec<&[GoldilocksField]> =
@@ -896,8 +887,8 @@ mod tests {
 
     #[test]
     fn test_fft_consistency() {
-        let guard = get_context().expect("Failed to get WebGPU context lock");
-        let ctx = guard.as_ref().expect("WebGPU context is None");
+        let ctx_guard = crate::context::acquire_context().expect("Failed to get WebGPU context");
+        let ctx = &*ctx_guard;
 
         for log_n in 12..=16 {
             let n = 1 << log_n;
@@ -923,8 +914,8 @@ mod tests {
 
     #[test]
     fn test_ifft_consistency() {
-        let guard = get_context().expect("Failed to get WebGPU context lock");
-        let ctx = guard.as_ref().expect("WebGPU context is None");
+        let ctx_guard = crate::context::acquire_context().expect("Failed to get WebGPU context");
+        let ctx = &*ctx_guard;
 
         for log_n in 12..=16 {
             let n = 1 << log_n;
