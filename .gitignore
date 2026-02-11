@@ -1,6 +1,15 @@
 # Cargo build
 /target
+**/target
 Cargo.lock
+
+# Node.js
+node_modules/
+package-lock.json
+
+# WASM build outputs (rebuilt via wasm-pack)
+web/benchmark-app/src/wasm/
+web/benchmark-app/dist/
 
 # Profile-guided optimization
 /tmp
