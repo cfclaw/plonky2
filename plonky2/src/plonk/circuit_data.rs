@@ -47,6 +47,8 @@ use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{CompressedProofWithPublicInputs, ProofWithPublicInputs};
 use crate::plonk::prover::prove;
+#[cfg(feature = "async_prover")]
+use crate::plonk::prover::prove_sync;
 use crate::plonk::verifier::verify;
 use crate::util::serialization::{
     Buffer, GateSerializer, IoResult, Read, WitnessGeneratorSerializer, Write,
@@ -186,8 +188,31 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         buffer.read_circuit_data(gate_serializer, generator_serializer)
     }
 
+    #[cfg(not(feature = "async_prover"))]
     pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
         prove::<F, C, D>(
+            &self.prover_only,
+            &self.common,
+            inputs,
+            &mut TimingTree::default(),
+        )
+    }
+
+    #[cfg(feature = "async_prover")]
+    pub async fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
+        prove::<F, C, D>(
+            &self.prover_only,
+            &self.common,
+            inputs,
+            &mut TimingTree::default(),
+        ).await
+    }
+
+    /// Synchronous CPU-only prove, available when `async_prover` is enabled.
+    /// Used internally for dummy proof generation during circuit building.
+    #[cfg(feature = "async_prover")]
+    pub(crate) fn prove_sync(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
+        prove_sync::<F, C, D>(
             &self.prover_only,
             &self.common,
             inputs,
@@ -284,6 +309,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         buffer.read_prover_circuit_data(gate_serializer, generator_serializer)
     }
 
+    #[cfg(not(feature = "async_prover"))]
     pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
         prove::<F, C, D>(
             &self.prover_only,
@@ -291,6 +317,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             inputs,
             &mut TimingTree::default(),
         )
+    }
+
+    #[cfg(feature = "async_prover")]
+    pub async fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
+        prove::<F, C, D>(
+            &self.prover_only,
+            &self.common,
+            inputs,
+            &mut TimingTree::default(),
+        ).await
     }
 }
 

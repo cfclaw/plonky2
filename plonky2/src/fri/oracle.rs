@@ -22,6 +22,10 @@ use crate::util::reducing::ReducingFactor;
 use crate::util::timing::TimingTree;
 use crate::util::reverse_bits;
 use crate::plonk::config::ProverCompute;
+#[cfg(feature = "async_prover")]
+use crate::util::{reverse_index_bits_in_place, transpose};
+#[cfg(feature = "async_prover")]
+use plonky2_util::log2_strict;
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
@@ -54,6 +58,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PolynomialBatch<F, C, D>
 {
     /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
+    #[cfg(not(feature = "async_prover"))]
     pub fn from_values(
         values: Vec<PolynomialValues<F>>,
         rate_bits: usize,
@@ -70,24 +75,188 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             cap_height,
             fft_root_table,
         )
-        /*
+    }
+
+    /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
+    /// Async version when the `async_prover` feature is enabled.
+    #[cfg(feature = "async_prover")]
+    pub async fn from_values(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<Self> {
+        C::Compute::compute_from_values(
+            timing,
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            fft_root_table,
+        ).await
+    }
+
+    /// CPU-only synchronous version of [`Self::from_values`].
+    /// Used during circuit building to avoid requiring async in the build path.
+    #[cfg(feature = "async_prover")]
+    pub fn from_values_cpu(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<Self> {
         let coeffs = timed!(
             timing,
             "IFFT",
             values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
         );
 
-        Self::from_coeffs(
-            coeffs,
+        const SALT_SIZE_CPU: usize = 4;
+        let salt_size = if blinding { SALT_SIZE_CPU } else { 0 };
+        let degree = coeffs[0].len();
+        let degree_log = log2_strict(degree);
+
+        let lde_values: Vec<Vec<F>> = timed!(
+            timing,
+            "generate LDE values",
+            coeffs
+                .par_iter()
+                .map(|p| {
+                    p.lde(rate_bits)
+                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                        .values
+                })
+                .chain(
+                    (0..salt_size)
+                        .into_par_iter()
+                        .map(|_| F::rand_vec(degree << rate_bits)),
+                )
+                .collect()
+        );
+
+        let mut leaves = transpose(&lde_values);
+        reverse_index_bits_in_place(&mut leaves);
+
+        let merkle_tree = timed!(
+            timing,
+            "Merkle tree",
+            MerkleTree::new(leaves, cap_height)
+        );
+
+        Ok(PolynomialBatch {
+            polynomials: coeffs,
+            merkle_tree,
+            degree_log,
+            rate_bits,
+            blinding,
+        })
+    }
+
+    /// CPU-only synchronous version of [`Self::from_coeffs`].
+    /// Used during circuit building to avoid requiring async in the build path.
+    #[cfg(feature = "async_prover")]
+    pub fn from_coeffs_cpu(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<Self> {
+        const SALT_SIZE_CPU: usize = 4;
+        let salt_size = if blinding { SALT_SIZE_CPU } else { 0 };
+        let degree = polynomials[0].len();
+        let degree_log = log2_strict(degree);
+
+        let lde_values: Vec<Vec<F>> = timed!(
+            timing,
+            "generate LDE values",
+            polynomials
+                .par_iter()
+                .map(|p| {
+                    p.lde(rate_bits)
+                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                        .values
+                })
+                .chain(
+                    (0..salt_size)
+                        .into_par_iter()
+                        .map(|_| F::rand_vec(degree << rate_bits)),
+                )
+                .collect()
+        );
+
+        let mut leaves = transpose(&lde_values);
+        reverse_index_bits_in_place(&mut leaves);
+
+        let merkle_tree = timed!(
+            timing,
+            "Merkle tree",
+            MerkleTree::new(leaves, cap_height)
+        );
+
+        Ok(PolynomialBatch {
+            polynomials,
+            merkle_tree,
+            degree_log,
+            rate_bits,
+            blinding,
+        })
+    }
+
+    /// CPU-only synchronous version that transposes quotient poly values,
+    /// converts to coefficients, and commits. Used during sync proving fallback.
+    #[cfg(feature = "async_prover")]
+    pub fn transpose_and_commit_cpu(
+        pre_transposed_quotient_polys: Vec<Vec<F>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<Self> {
+        let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
+            timing,
+            "coset IFFT quotient polys",
+            transpose(&pre_transposed_quotient_polys)
+                .into_par_iter()
+                .map(PolynomialValues::new)
+                .map(|values| values.coset_ifft(F::coset_shift()))
+                .collect::<Vec<_>>()
+        );
+
+        let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+            timing,
+            "split up quotient polys",
+            quotient_polys
+                .into_par_iter()
+                .flat_map(|mut quotient_poly| {
+                    quotient_poly.trim_to_len(quotient_degree).expect(
+                        "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                    );
+                    quotient_poly.chunks(degree)
+                })
+                .collect()
+        );
+
+        Self::from_coeffs_cpu(
+            all_quotient_poly_chunks,
             rate_bits,
             blinding,
             cap_height,
             timing,
             fft_root_table,
-        )*/
+        )
     }
 
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
+    #[cfg(not(feature = "async_prover"))]
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,
         rate_bits: usize,
@@ -104,6 +273,27 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             blinding,
             fft_root_table,
         )
+    }
+
+    /// Creates a list polynomial commitment for the polynomials `polynomials`.
+    /// Async version when the `async_prover` feature is enabled.
+    #[cfg(feature = "async_prover")]
+    pub async fn from_coeffs(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<Self> {
+        C::Compute::compute_from_coeffs(
+            timing,
+            polynomials,
+            cap_height,
+            rate_bits,
+            blinding,
+            fft_root_table,
+        ).await
     }
 
     /// Fetches LDE values at the `index * step`th point.

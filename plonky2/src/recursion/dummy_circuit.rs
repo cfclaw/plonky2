@@ -38,6 +38,7 @@ use crate::util::serialization::{Buffer, DefaultGateSerializer, IoResult, Read, 
 /// public inputs which encode the cyclic verification key must be set properly, and this method
 /// takes care of that. It also allows the user to specify any other public inputs which should be
 /// set in this base proof.
+#[cfg(not(feature = "async_prover"))]
 pub fn cyclic_base_proof<F, C, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
     verifier_data: &VerifierOnlyCircuitData<C, D>,
@@ -69,9 +70,44 @@ where
     .unwrap()
 }
 
+/// Version of [`cyclic_base_proof`] that uses the sync CPU prove path when the
+/// `async_prover` feature is enabled. This avoids requiring an async runtime
+/// for base proof generation.
+#[cfg(feature = "async_prover")]
+pub fn cyclic_base_proof<F, C, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    verifier_data: &VerifierOnlyCircuitData<C, D>,
+    mut nonzero_public_inputs: HashMap<usize, F>,
+) -> ProofWithPublicInputs<F, C, D>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    C::Hasher: AlgebraicHasher<C::F>,
+{
+    let pis_len = common_data.num_public_inputs;
+    let cap_elements = common_data.config.fri_config.num_cap_elements();
+    let start_vk_pis = pis_len - 4 - 4 * cap_elements;
+
+    nonzero_public_inputs.extend((start_vk_pis..).zip(verifier_data.circuit_digest.elements));
+    for i in 0..cap_elements {
+        let start = start_vk_pis + 4 + 4 * i;
+        nonzero_public_inputs
+            .extend((start..).zip(verifier_data.constants_sigmas_cap.0[i].elements));
+    }
+
+    let circuit = dummy_circuit::<F, C, D>(common_data);
+    let mut pw = PartialWitness::new();
+    for i in 0..circuit.common.num_public_inputs {
+        let pi = nonzero_public_inputs.get(&i).copied().unwrap_or_default();
+        pw.set_target(circuit.prover_only.public_inputs[i], pi).unwrap();
+    }
+    circuit.prove_sync(pw).unwrap()
+}
+
 /// Generate a proof for a dummy circuit. The `public_inputs` parameter let the caller specify
 /// certain public inputs (identified by their indices) which should be given specific values.
 /// The rest will default to zero.
+#[cfg(not(feature = "async_prover"))]
 pub fn dummy_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     circuit: &CircuitData<F, C, D>,
     nonzero_public_inputs: HashMap<usize, F>,
@@ -84,6 +120,22 @@ where
         pw.set_target(circuit.prover_only.public_inputs[i], pi)?;
     }
     circuit.prove(pw)
+}
+
+/// Async version of [`dummy_proof`] when the `async_prover` feature is enabled.
+#[cfg(feature = "async_prover")]
+pub async fn dummy_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    circuit: &CircuitData<F, C, D>,
+    nonzero_public_inputs: HashMap<usize, F>,
+) -> anyhow::Result<ProofWithPublicInputs<F, C, D>>
+where
+{
+    let mut pw = PartialWitness::new();
+    for i in 0..circuit.common.num_public_inputs {
+        let pi = nonzero_public_inputs.get(&i).copied().unwrap_or_default();
+        pw.set_target(circuit.prover_only.public_inputs[i], pi)?;
+    }
+    circuit.prove(pw).await
 }
 
 /// Generate a circuit matching a given `CommonCircuitData`.
@@ -126,7 +178,18 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         C::Hasher: AlgebraicHasher<F>,
     {
         let dummy_circuit = dummy_circuit::<F, C, D>(common_data);
+        // Use sync CPU prove path when async_prover is enabled, since this is called
+        // during circuit building which must remain synchronous.
+        #[cfg(not(feature = "async_prover"))]
         let dummy_proof_with_pis = dummy_proof::<F, C, D>(&dummy_circuit, HashMap::new())?;
+        #[cfg(feature = "async_prover")]
+        let dummy_proof_with_pis = dummy_circuit.prove_sync({
+            let mut pw = PartialWitness::new();
+            for i in 0..dummy_circuit.common.num_public_inputs {
+                pw.set_target(dummy_circuit.prover_only.public_inputs[i], F::ZERO)?;
+            }
+            pw
+        })?;
         let dummy_proof_with_pis_target = self.add_virtual_proof_with_pis(common_data);
         let dummy_verifier_data_target =
             self.add_virtual_verifier_data(self.config.fri_config.cap_height);

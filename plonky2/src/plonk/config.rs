@@ -105,6 +105,7 @@ pub trait AlgebraicHasher<F: RichField>: 'static + Hasher<F, Hash = HashOut<F>> 
 
 /// Trait to abstract heavy prover computations (FFT + Merkle Hashing).
 /// An external crate can implement this to provide GPU acceleration.
+#[cfg(not(feature = "async_prover"))]
 pub trait ProverCompute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>:
     'static + Debug + Clone + Send + Sync
 {
@@ -147,9 +148,55 @@ pub trait ProverCompute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>
     ) -> anyhow::Result<MerkleTree<F, C::Hasher>>;
 }
 
+/// Async version of [`ProverCompute`] when the `async_prover` feature is enabled.
+/// All methods are async to support non-blocking GPU acceleration (e.g. WebGPU).
+#[cfg(feature = "async_prover")]
+pub trait ProverCompute<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>:
+    'static + Debug + Clone + Send + Sync
+{
+    /// Takes polynomial coefficients, performs ifft, then performs LDE (FFT), and commits to the Merkle tree.
+    async fn transpose_and_compute_from_coeffs(
+        timing: &mut TimingTree,
+        pre_transposed_quotient_polys: Vec<Vec<F>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>>;
+
+    async fn compute_from_values(
+        timing: &mut TimingTree,
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>>;
+
+    /// Takes polynomial coefficients, performs LDE (FFT), and commits to the Merkle tree.
+    async fn compute_from_coeffs(
+        timing: &mut TimingTree,
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        cap_height: usize,
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>>;
+
+    async fn build_merkle_tree(
+        timing: &mut TimingTree,
+        leaves: Vec<Vec<F>>,
+        cap_height: usize,
+    ) -> anyhow::Result<MerkleTree<F, C::Hasher>>;
+}
+
 /// Default CPU implementation of `ProverCompute`.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct CpuProverCompute;
+
+#[cfg(not(feature = "async_prover"))]
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ProverCompute<F, C, D> for CpuProverCompute
 {
@@ -161,7 +208,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         blinding: bool,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        //println!("CPU ProverCompute::compute_from_coeffs called");
         const SALT_SIZE: usize = 4;
         let salt_size = if blinding { SALT_SIZE } else { 0 };
 
@@ -211,7 +257,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        //println!("CPU ProverCompute::compute_from_values called");
         let coeffs = timed!(
             timing,
             "IFFT",
@@ -237,7 +282,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         cap_height: usize,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-        //println!("CPU ProverCompute::transpose_and_compute_from_coeffs called");
         let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
             timing,
             "coset IFFT quotient polys",
@@ -283,7 +327,141 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         leaves: Vec<Vec<F>>,
         cap_height: usize,
     ) -> anyhow::Result<MerkleTree<F, C::Hasher>> {
-        //println!("CPU ProverCompute::build_merkle_tree called");
+        let merkle_tree = timed!(timing, "Merkle tree", MerkleTree::new(leaves, cap_height));
+        Ok(merkle_tree)
+    }
+}
+
+#[cfg(feature = "async_prover")]
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    ProverCompute<F, C, D> for CpuProverCompute
+{
+    async fn compute_from_coeffs(
+        timing: &mut TimingTree,
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        cap_height: usize,
+        rate_bits: usize,
+        blinding: bool,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+        const SALT_SIZE: usize = 4;
+        let salt_size = if blinding { SALT_SIZE } else { 0 };
+
+        let degree = polynomials[0].len();
+        let degree_log = log2_strict(degree);
+
+        let lde_values: Vec<Vec<F>> = timed!(
+            timing,
+            "generate LDE values",
+            polynomials
+                .par_iter()
+                .map(|p| {
+                    p.lde(rate_bits)
+                        .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
+                        .values
+                })
+                .chain(
+                    (0..salt_size)
+                        .into_par_iter()
+                        .map(|_| F::rand_vec(degree << rate_bits)),
+                )
+                .collect()
+        );
+
+        let mut leaves = transpose(&lde_values);
+        reverse_index_bits_in_place(&mut leaves);
+
+        let merkle_tree = timed!(
+            timing,
+            "Merkle tree",
+            <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height).await?
+        );
+        Ok(PolynomialBatch {
+            polynomials,
+            merkle_tree,
+            degree_log,
+            rate_bits,
+            blinding,
+        })
+    }
+
+    async fn compute_from_values(
+        timing: &mut TimingTree,
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+        let coeffs = timed!(
+            timing,
+            "IFFT",
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        );
+        Self::compute_from_coeffs(
+            timing,
+            coeffs,
+            cap_height,
+            rate_bits,
+            blinding,
+            fft_root_table,
+        ).await
+    }
+
+    async fn transpose_and_compute_from_coeffs(
+        timing: &mut TimingTree,
+        pre_transposed_quotient_polys: Vec<Vec<F>>,
+        quotient_degree: usize,
+        degree: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
+        let quotient_polys: Vec<PolynomialCoeffs<F>> = timed!(
+            timing,
+            "coset IFFT quotient polys",
+            transpose(&pre_transposed_quotient_polys)
+                .into_par_iter()
+                .map(PolynomialValues::new)
+                .map(|values| values.coset_ifft(F::coset_shift()))
+                .collect::<Vec<_>>()
+        );
+
+        let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+            timing,
+            "split up quotient polys",
+            quotient_polys
+                .into_par_iter()
+                .flat_map(|mut quotient_poly| {
+                    quotient_poly.trim_to_len(quotient_degree).expect(
+                        "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                    );
+                    quotient_poly.chunks(degree)
+                })
+                .collect()
+        );
+
+        let quotient_polys_commitment = timed!(
+            timing,
+            "commit to quotient polys",
+            Self::compute_from_coeffs(
+                timing,
+                all_quotient_poly_chunks,
+                cap_height,
+                rate_bits,
+                blinding,
+                fft_root_table,
+            ).await?
+        );
+        Ok(quotient_polys_commitment)
+    }
+
+    async fn build_merkle_tree(
+        timing: &mut TimingTree,
+        leaves: Vec<Vec<F>>,
+        cap_height: usize,
+    ) -> anyhow::Result<MerkleTree<F, C::Hasher>> {
         let merkle_tree = timed!(timing, "Merkle tree", MerkleTree::new(leaves, cap_height));
         Ok(merkle_tree)
     }

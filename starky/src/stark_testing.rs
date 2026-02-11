@@ -73,6 +73,7 @@ pub fn test_stark_low_degree<F: RichField + Extendable<D>, S: Stark<F, D>, const
 }
 
 /// Tests that the circuit constraints imposed by the given STARK are coherent with the native constraints.
+#[cfg(not(feature = "async_prover"))]
 pub fn test_stark_circuit_constraints<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -138,6 +139,74 @@ pub fn test_stark_circuit_constraints<
 
     let data = builder.build::<C>();
     let proof = data.prove(pw)?;
+    data.verify(proof)
+}
+
+/// Async version of [`test_stark_circuit_constraints`] when the `async_prover` feature is enabled.
+#[cfg(feature = "async_prover")]
+pub async fn test_stark_circuit_constraints<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    S: Stark<F, D>,
+    const D: usize,
+>(
+    stark: S,
+) -> Result<()> {
+    let vars = S::EvaluationFrame::from_values(
+        &F::Extension::rand_vec(S::COLUMNS),
+        &F::Extension::rand_vec(S::COLUMNS),
+        &F::Extension::rand_vec(S::PUBLIC_INPUTS),
+    );
+    let alphas = F::rand_vec(1);
+    let z_last = F::Extension::rand();
+    let lagrange_first = F::Extension::rand();
+    let lagrange_last = F::Extension::rand();
+    let mut consumer = ConstraintConsumer::<F::Extension>::new(
+        alphas
+            .iter()
+            .copied()
+            .map(F::Extension::from_basefield)
+            .collect(),
+        z_last,
+        lagrange_first,
+        lagrange_last,
+    );
+    stark.eval_ext(&vars, &mut consumer);
+    let native_eval = consumer.accumulators()[0];
+    let circuit_config = CircuitConfig::standard_recursion_config();
+    let mut builder = CircuitBuilder::<F, D>::new(circuit_config);
+    let mut pw = PartialWitness::<F>::new();
+
+    let locals_t = builder.add_virtual_extension_targets(S::COLUMNS);
+    pw.set_extension_targets(&locals_t, vars.get_local_values())?;
+    let nexts_t = builder.add_virtual_extension_targets(S::COLUMNS);
+    pw.set_extension_targets(&nexts_t, vars.get_next_values())?;
+    let pis_t = builder.add_virtual_extension_targets(S::PUBLIC_INPUTS);
+    pw.set_extension_targets(&pis_t, vars.get_public_inputs())?;
+    let alphas_t = builder.add_virtual_targets(1);
+    pw.set_target(alphas_t[0], alphas[0])?;
+    let z_last_t = builder.add_virtual_extension_target();
+    pw.set_extension_target(z_last_t, z_last)?;
+    let lagrange_first_t = builder.add_virtual_extension_target();
+    pw.set_extension_target(lagrange_first_t, lagrange_first)?;
+    let lagrange_last_t = builder.add_virtual_extension_target();
+    pw.set_extension_target(lagrange_last_t, lagrange_last)?;
+
+    let vars = S::EvaluationFrameTarget::from_values(&locals_t, &nexts_t, &pis_t);
+    let mut consumer = RecursiveConstraintConsumer::<F, D>::new(
+        builder.zero_extension(),
+        alphas_t,
+        z_last_t,
+        lagrange_first_t,
+        lagrange_last_t,
+    );
+    stark.eval_ext_circuit(&mut builder, &vars, &mut consumer);
+    let circuit_eval = consumer.accumulators()[0];
+    let native_eval_t = builder.constant_extension(native_eval);
+    builder.connect_extension(circuit_eval, native_eval_t);
+
+    let data = builder.build::<C>();
+    let proof = data.prove(pw).await?;
     data.verify(proof)
 }
 
