@@ -169,6 +169,8 @@ fn generate_fft_shaders(out_dir: &str) {
         ("fft_dit_pass", include_str!("src/shaders/fft_dit_pass.wgsl")),
         ("bit_reverse_copy", include_str!("src/shaders/bit_reverse_copy.wgsl")),
         ("ifft_reorder", include_str!("src/shaders/ifft_reorder.wgsl")),
+        ("mont_convert", include_str!("src/shaders/mont_convert.wgsl")),
+        ("transpose", include_str!("src/shaders/transpose.wgsl")),
     ];
 
     for (name, kernel_src) in kernels {

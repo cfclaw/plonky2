@@ -60,9 +60,10 @@ pub fn verify_merkle_proof_to_cap<F: RichField, H: Hasher<F>>(
     merkle_cap: &MerkleCap<F, H>,
     proof: &MerkleProof<F, H>,
 ) -> Result<()> {
+    let siblings_len = proof.siblings.len();
     verify_batch_merkle_proof_to_cap(
-        &[leaf_data.clone()],
-        &[proof.siblings.len()],
+        &[leaf_data],
+        &[siblings_len],
         leaf_index,
         merkle_cap,
         proof,
@@ -93,8 +94,11 @@ pub fn verify_batch_merkle_proof_to_cap<F: RichField, H: Hasher<F>>(
         current_height -= 1;
 
         if leaf_data_index < leaf_heights.len() && current_height == leaf_heights[leaf_data_index] {
-            let mut new_leaves = current_digest.to_vec();
-            new_leaves.extend_from_slice(&leaf_data[leaf_data_index]);
+            let digest_elems = current_digest.to_vec();
+            let extra = &leaf_data[leaf_data_index];
+            let mut new_leaves = Vec::with_capacity(digest_elems.len() + extra.len());
+            new_leaves.extend_from_slice(&digest_elems);
+            new_leaves.extend_from_slice(extra);
             current_digest = H::hash_or_noop(&new_leaves);
             leaf_data_index += 1;
         }

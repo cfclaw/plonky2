@@ -13,9 +13,8 @@ use plonky2::hash::poseidon::PoseidonHash;
 use plonky2::plonk::config::{CpuProverCompute, GenericConfig, ProverCompute};
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
-use plonky2::util::{log2_strict, transpose};
+use plonky2::util::log2_strict;
 use plonky2_maybe_rayon::*;
-use plonky2_util::reverse_index_bits_in_place;
 use serde::Serialize;
 
 #[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Serialize)]
@@ -49,6 +48,159 @@ mod fft {
         twiddle_offset: u32,
     }
 
+    /// Params for the Montgomery conversion shader
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    pub(super) struct MontConvertParams {
+        n: u32,
+        num_polys: u32,
+        direction: u32, // 0 = to_mont, 1 = from_mont
+        _pad: u32,
+    }
+
+    /// Params for the transpose shader
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    pub(super) struct TransposeParams {
+        lde_size: u32,
+        num_polys: u32,
+        num_cols: u32,
+        log_lde_size: u32,
+    }
+
+    /// Encode a Montgomery conversion pass into the command encoder.
+    /// Converts the buffer in-place: direction 0 = to_mont, 1 = from_mont.
+    pub(super) fn encode_mont_convert(
+        ctx: &WebGpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        buffer: &wgpu::Buffer,
+        n: usize,
+        num_polys: usize,
+        direction: u32,
+    ) {
+        let pipeline = ctx.get_pipeline("mont_convert_batched").unwrap();
+
+        let params = MontConvertParams {
+            n: n as u32,
+            num_polys: num_polys as u32,
+            direction,
+            _pad: 0,
+        };
+        let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mont_convert_bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("mont_convert_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, Some(&bind_group), &[]);
+        let wg_x = utils::div_ceil(n as u32, 256);
+        pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
+        drop(pass);
+    }
+
+    /// Encode a transpose + bit_reverse pass into the command encoder.
+    /// Transposes from polynomial-major (src) to evaluation-major with bit-reversed rows (dst).
+    pub(super) fn encode_transpose_and_bit_reverse(
+        ctx: &WebGpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src: &wgpu::Buffer,
+        dst: &wgpu::Buffer,
+        lde_size: usize,
+        num_polys: usize,
+        num_cols: usize,
+        log_lde_size: usize,
+    ) {
+        let pipeline = ctx.get_pipeline("transpose_and_bit_reverse").unwrap();
+
+        let params = TransposeParams {
+            lde_size: lde_size as u32,
+            num_polys: num_polys as u32,
+            num_cols: num_cols as u32,
+            log_lde_size: log_lde_size as u32,
+        };
+        let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transpose_bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("transpose_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, Some(&bind_group), &[]);
+        let wg_x = utils::div_ceil(lde_size as u32, 256);
+        pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
+        drop(pass);
+    }
+
+    /// Upload raw GoldilocksField data from multiple slices into a contiguous GPU buffer.
+    /// Returns the buffer with elements as raw u64 bytes (standard form, not Montgomery).
+    fn upload_raw_field_slices(
+        ctx: &WebGpuContext,
+        slices: &[&[GoldilocksField]],
+        elements_per_slice: usize,
+    ) -> wgpu::Buffer {
+        let num_slices = slices.len();
+        let total_bytes = (num_slices * elements_per_slice * 8) as u64;
+
+        let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("field_upload"),
+            size: total_bytes,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = buffer.slice(..).get_mapped_range_mut();
+            for (i, slice) in slices.iter().enumerate() {
+                let offset = i * elements_per_slice * 8;
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        slice.as_ptr() as *const u8,
+                        elements_per_slice * 8,
+                    )
+                };
+                mapped[offset..offset + elements_per_slice * 8].copy_from_slice(bytes);
+            }
+        }
+        buffer.unmap();
+        buffer
+    }
+
     /// Encode batched FFT DIT passes into the command encoder.
     fn encode_fft_passes_batched(
         ctx: &WebGpuContext,
@@ -75,17 +227,7 @@ mod fft {
                 twiddle_offset: twiddle_elem_offset,
             };
 
-            let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("fft_dit_params"),
-                size: std::mem::size_of::<FftParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            });
-            params_buffer
-                .slice(..)
-                .get_mapped_range_mut()
-                .copy_from_slice(bytemuck::bytes_of(&params));
-            params_buffer.unmap();
+            let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
 
             let bind_group_layout = pipeline.get_bind_group_layout(0);
             let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -122,9 +264,104 @@ mod fft {
         }
     }
 
+    /// Core coset FFT encoding. Uploads coefficients, encodes to_mont + coset_scale + FFT passes.
+    /// Returns (src_buffer, dst_buffer). After submission, dst_buffer contains FFT results
+    /// still in Montgomery form.
+    pub(super) fn encode_coset_fft_batched(
+        ctx: &WebGpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        all_coeffs: &[&[GoldilocksField]],
+        log_lde_size: usize,
+        shift: GoldilocksField,
+    ) -> Result<(wgpu::Buffer, wgpu::Buffer)> {
+        let num_polys = all_coeffs.len();
+        let num_coeffs = all_coeffs[0].len();
+        let lde_size = 1 << log_lde_size;
+
+        // Upload raw coefficients (no CPU-side Montgomery conversion)
+        let src_buffer = upload_raw_field_slices(ctx, all_coeffs, num_coeffs);
+
+        // GPU: convert to Montgomery form
+        encode_mont_convert(ctx, encoder, &src_buffer, num_coeffs, num_polys, 0);
+
+        // Upload shift powers (small, keep computing on CPU since it's just num_coeffs elements)
+        let powers_of_shift: Vec<u64> = shift
+            .powers()
+            .take(num_coeffs)
+            .map(|f| utils::to_mont(f.0))
+            .collect();
+        let shifts_buffer = utils::upload_u64_data(&ctx.device, &powers_of_shift, "fft_shifts");
+
+        let dst_size = (num_polys * lde_size * 8) as u64;
+        let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "fft_dst");
+
+        // Coset scale + bit reverse params
+        let params = FftParams {
+            n: lde_size as u32,
+            log_n: log_lde_size as u32,
+            num_coeffs: num_coeffs as u32,
+            layer: 0,
+            stride: lde_size as u32,
+            n_inv_lo: 0,
+            n_inv_hi: 0,
+            twiddle_offset: 0,
+        };
+        let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
+
+        // Encode coset scale + bit reverse
+        {
+            let pipeline = ctx
+                .get_pipeline("coset_scale_and_bit_reverse_batched")
+                .unwrap();
+            let bind_group_layout = pipeline.get_bind_group_layout(0);
+            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("coset_scale_bg"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: dst_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: src_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: shifts_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("coset_scale_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
+            let wg_x = utils::div_ceil(lde_size as u32, 256);
+            pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
+            drop(pass);
+        }
+
+        // Encode FFT passes
+        let twiddles = ctx
+            .twiddle_buffers
+            .get(&log_lde_size)
+            .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", log_lde_size))?;
+        encode_fft_passes_batched(ctx, encoder, &dst_buffer, log_lde_size, lde_size, num_polys, twiddles);
+
+        Ok((src_buffer, dst_buffer))
+    }
+
     macro_rules! impl_fft_batch_functions {
         ($($async_kw:tt)*) => {
             /// Batch coset FFT: process all polynomials in a single GPU dispatch sequence.
+            /// Uploads raw field elements and performs Montgomery conversion on GPU.
             pub $($async_kw)* fn run_gpu_coset_fft_batch(
                 ctx: &WebGpuContext,
                 all_coeffs: &[&[GoldilocksField]],
@@ -136,121 +373,31 @@ mod fft {
                     return Ok(vec![]);
                 }
 
-                let num_coeffs = all_coeffs[0].len();
                 let lde_size = 1 << log_lde_size;
-
-                let powers_of_shift: Vec<u64> = shift
-                    .powers()
-                    .take(num_coeffs)
-                    .map(|f| utils::to_mont(f.0))
-                    .collect();
-
-                let mut src_mont: Vec<u64> = Vec::with_capacity(num_polys * num_coeffs);
-                for coeffs in all_coeffs {
-                    for c in *coeffs {
-                        src_mont.push(utils::to_mont(c.0));
-                    }
-                }
-
-                let src_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("fft_src"),
-                    size: (src_mont.len() * 8) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: true,
-                });
-                src_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-                    unsafe { std::slice::from_raw_parts(src_mont.as_ptr() as *const u8, src_mont.len() * 8) }
-                );
-                src_buffer.unmap();
-
-                let dst_size = (num_polys * lde_size * 8) as u64;
-                let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "fft_dst");
-
-                let shifts_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("fft_shifts"),
-                    size: (powers_of_shift.len() * 8) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: true,
-                });
-                shifts_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-                    unsafe { std::slice::from_raw_parts(powers_of_shift.as_ptr() as *const u8, powers_of_shift.len() * 8) }
-                );
-                shifts_buffer.unmap();
-
-                let params = FftParams {
-                    n: lde_size as u32,
-                    log_n: log_lde_size as u32,
-                    num_coeffs: num_coeffs as u32,
-                    layer: 0,
-                    stride: lde_size as u32,
-                    n_inv_lo: 0,
-                    n_inv_hi: 0,
-                    twiddle_offset: 0,
-                };
-                let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("fft_scale_params"),
-                    size: std::mem::size_of::<FftParams>() as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: true,
-                });
-                params_buffer
-                    .slice(..)
-                    .get_mapped_range_mut()
-                    .copy_from_slice(bytemuck::bytes_of(&params));
-                params_buffer.unmap();
 
                 let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("fft_coset_encoder"),
                 });
 
-                // Step 1: Coset scale + bit reverse
-                {
-                    let pipeline = ctx.get_pipeline("coset_scale_and_bit_reverse_batched").unwrap();
-                    let bind_group_layout = pipeline.get_bind_group_layout(0);
-                    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("coset_scale_bg"),
-                        layout: &bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: dst_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 1, resource: src_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 2, resource: shifts_buffer.as_entire_binding() },
-                            wgpu::BindGroupEntry { binding: 3, resource: params_buffer.as_entire_binding() },
-                        ],
-                    });
+                let (_src_buffer, dst_buffer) =
+                    encode_coset_fft_batched(ctx, &mut encoder, all_coeffs, log_lde_size, shift)?;
 
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("coset_scale_pass"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(pipeline);
-                    pass.set_bind_group(0, Some(&bind_group), &[]);
-                    let wg_x = utils::div_ceil(lde_size as u32, 256);
-                    pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
-                    drop(pass);
-                }
-
-                // Step 2: Batched FFT passes
-                let twiddles = ctx.twiddle_buffers.get(&log_lde_size)
-                    .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", log_lde_size))?;
-                encode_fft_passes_batched(
-                    ctx, &mut encoder, &dst_buffer, log_lde_size, lde_size, num_polys, twiddles,
-                );
+                // GPU: convert from Montgomery form (in-place on dst_buffer)
+                encode_mont_convert(ctx, &mut encoder, &dst_buffer, lde_size, num_polys, 1);
 
                 ctx.queue.submit(Some(encoder.finish()));
 
-                // Read back results and convert from Montgomery form
-                let all_mont = plonky2::maybe_await!(
+                // Download results (already in standard form - no CPU from_mont needed)
+                let all_data = plonky2::maybe_await!(
                     utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * lde_size)
                 );
 
+                // Split into per-polynomial vectors
                 let results: Vec<Vec<GoldilocksField>> = (0..num_polys)
                     .into_par_iter()
                     .map(|i| {
                         let offset = i * lde_size;
-                        all_mont[offset..offset + lde_size]
-                            .iter()
-                            .map(|f| GoldilocksField(utils::from_mont(f.0)))
-                            .collect()
+                        all_data[offset..offset + lde_size].to_vec()
                     })
                     .collect();
 
@@ -258,6 +405,7 @@ mod fft {
             }
 
             /// Batch IFFT: process all polynomials in a single GPU dispatch sequence.
+            /// Uploads raw field elements and performs Montgomery conversion on GPU.
             pub $($async_kw)* fn run_gpu_ifft_batch(
                 ctx: &WebGpuContext,
                 all_values: &[&[GoldilocksField]],
@@ -270,23 +418,8 @@ mod fft {
                 let n = all_values[0].len();
                 let log_n = log2_strict(n);
 
-                let mut src_mont: Vec<u64> = Vec::with_capacity(num_polys * n);
-                for values in all_values {
-                    for v in *values {
-                        src_mont.push(utils::to_mont(v.0));
-                    }
-                }
-
-                let src_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("ifft_src"),
-                    size: (src_mont.len() * 8) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: true,
-                });
-                src_buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-                    unsafe { std::slice::from_raw_parts(src_mont.as_ptr() as *const u8, src_mont.len() * 8) }
-                );
-                src_buffer.unmap();
+                // Upload raw field elements (no CPU-side Montgomery conversion)
+                let src_buffer = upload_raw_field_slices(ctx, all_values, n);
 
                 let dst_size = (num_polys * n * 8) as u64;
                 let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "ifft_dst");
@@ -294,6 +427,9 @@ mod fft {
                 let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("ifft_encoder"),
                 });
+
+                // GPU: convert source to Montgomery form
+                encode_mont_convert(ctx, &mut encoder, &src_buffer, n, num_polys, 0);
 
                 // Step 1: Bit-reverse copy
                 {
@@ -307,17 +443,7 @@ mod fft {
                         n_inv_hi: 0,
                         twiddle_offset: 0,
                     };
-                    let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("br_params"),
-                        size: std::mem::size_of::<FftParams>() as u64,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: true,
-                    });
-                    params_buffer
-                        .slice(..)
-                        .get_mapped_range_mut()
-                        .copy_from_slice(bytemuck::bytes_of(&params));
-                    params_buffer.unmap();
+                    let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
 
                     let pipeline = ctx.get_pipeline("bit_reverse_copy_batched").unwrap();
                     let bind_group_layout = pipeline.get_bind_group_layout(0);
@@ -362,17 +488,7 @@ mod fft {
                         n_inv_hi: (n_inv_mont >> 32) as u32,
                         twiddle_offset: 0,
                     };
-                    let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("ifft_reorder_params"),
-                        size: std::mem::size_of::<FftParams>() as u64,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: true,
-                    });
-                    params_buffer
-                        .slice(..)
-                        .get_mapped_range_mut()
-                        .copy_from_slice(bytemuck::bytes_of(&params));
-                    params_buffer.unmap();
+                    let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
 
                     let pipeline = ctx.get_pipeline("ifft_reorder_and_scale_batched").unwrap();
                     let bind_group_layout = pipeline.get_bind_group_layout(0);
@@ -396,22 +512,22 @@ mod fft {
                     drop(pass);
                 }
 
+                // GPU: convert from Montgomery form (in-place on dst_buffer)
+                encode_mont_convert(ctx, &mut encoder, &dst_buffer, n, num_polys, 1);
+
                 ctx.queue.submit(Some(encoder.finish()));
 
-                // Read back results and convert from Montgomery form
-                let all_mont = plonky2::maybe_await!(
+                // Download results (already in standard form)
+                let all_data = plonky2::maybe_await!(
                     utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * n)
                 );
 
+                // Split into PolynomialCoeffs (no from_mont needed)
                 let results: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_polys)
                     .into_par_iter()
                     .map(|i| {
                         let offset = i * n;
-                        let coeffs: Vec<GoldilocksField> = all_mont[offset..offset + n]
-                            .iter()
-                            .map(|f| GoldilocksField(utils::from_mont(f.0)))
-                            .collect();
-                        PolynomialCoeffs::new(coeffs)
+                        PolynomialCoeffs::new(all_data[offset..offset + n].to_vec())
                     })
                     .collect();
 
@@ -495,7 +611,7 @@ macro_rules! impl_webgpu_prover_compute {
 
                     const HASH_SIZE: usize = 4; // NUM_HASH_OUT_ELTS
 
-                    // Step 1: Upload flattened leaf data
+                    // Upload flattened leaf data directly from slices (no intermediate Vec)
                     let total_input_elems = num_leaves * leaf_size;
                     let input_bytes = (total_input_elems * 8) as u64;
                     let input_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -519,7 +635,7 @@ macro_rules! impl_webgpu_prover_compute {
                     }
                     input_buffer.unmap();
 
-                    // Step 2: Create ping/pong and tree buffers
+                    // Create ping/pong and tree buffers
                     let leaf_hash_bytes = (num_leaves * HASH_SIZE * 8) as u64;
                     let ping_buffer =
                         utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_ping");
@@ -541,7 +657,7 @@ macro_rules! impl_webgpu_prover_compute {
                                 label: Some("merkle_encoder"),
                             });
 
-                    // Step 3: Dispatch leaf hashing
+                    // Dispatch leaf hashing
                     let use_copy = leaf_size <= HASH_SIZE;
                     let pipeline_name = if use_copy {
                         "copy_row_leaves"
@@ -599,7 +715,7 @@ macro_rules! impl_webgpu_prover_compute {
                         drop(pass);
                     }
 
-                    // Step 4: Compress layers (ping-pong)
+                    // Compress layers (ping-pong)
                     let subtree_height = log2_leaves - cap_height;
                     let subtree_digest_len = if subtree_height > 0 {
                         2 * ((1usize << subtree_height) - 1)
@@ -674,7 +790,7 @@ macro_rules! impl_webgpu_prover_compute {
 
                     ctx.queue.submit(Some(encoder.finish()));
 
-                    // Step 5: Read back results
+                    // Read back results
                     let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
                         let raw = plonky2::maybe_await!(utils::download_field_data(
                             &ctx.device,
@@ -740,10 +856,13 @@ macro_rules! impl_webgpu_prover_compute {
 
                 const SALT_SIZE: usize = 4;
                 let salt_size = if blinding { SALT_SIZE } else { 0 };
+                let num_polys = polynomials.len();
+                let lde_size = 1 << lde_degree_log;
+                let num_cols = num_polys + salt_size;
 
-                let lde_values: Vec<Vec<F>> = timed!(
+                let leaves: Vec<Vec<F>> = timed!(
                     timing,
-                    "generate LDE values (WebGPU)",
+                    "FFT + transpose (WebGPU fused)",
                     {
                         let ctx_guard = crate::context::acquire_context()?;
                         let ctx = &*ctx_guard;
@@ -751,20 +870,81 @@ macro_rules! impl_webgpu_prover_compute {
                         let coeff_slices: Vec<&[F]> =
                             polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
 
-                        let mut lde_values = plonky2::maybe_await!(
-                            fft::run_gpu_coset_fft_batch(ctx, &coeff_slices, lde_degree_log, F::coset_shift())
+                        let mut encoder = ctx.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("fused_fft_transpose_encoder"),
+                            },
+                        );
+
+                        // GPU: upload + to_mont + coset_scale + FFT (results in Montgomery on dst_buffer)
+                        let (_src_buffer, dst_buffer) = fft::encode_coset_fft_batched(
+                            ctx,
+                            &mut encoder,
+                            &coeff_slices,
+                            lde_degree_log,
+                            F::coset_shift(),
                         )?;
 
-                        for _ in 0..salt_size {
-                            lde_values.push(F::rand_vec(1 << lde_degree_log));
-                        }
+                        // GPU: convert from Montgomery form
+                        fft::encode_mont_convert(ctx, &mut encoder, &dst_buffer, lde_size, num_polys, 1);
 
-                        lde_values
+                        // GPU: transpose + bit_reverse (poly-major → evaluation-major with bit-reversed rows)
+                        // Output buffer has num_cols columns per row (leaves room for salt columns)
+                        let leaf_buffer_size = (lde_size * num_cols * 8) as u64;
+                        let leaf_buffer = utils::create_storage_buffer(
+                            &ctx.device,
+                            leaf_buffer_size,
+                            "transposed_leaves",
+                        );
+                        fft::encode_transpose_and_bit_reverse(
+                            ctx,
+                            &mut encoder,
+                            &dst_buffer,
+                            &leaf_buffer,
+                            lde_size,
+                            num_polys,
+                            num_cols,
+                            lde_degree_log,
+                        );
+
+                        // Submit all GPU work at once (to_mont + coset_scale + FFT + from_mont + transpose)
+                        ctx.queue.submit(Some(encoder.finish()));
+
+                        // Download transposed leaf data
+                        let all_leaf_data = plonky2::maybe_await!(
+                            utils::download_field_data(
+                                &ctx.device,
+                                &ctx.queue,
+                                &leaf_buffer,
+                                lde_size * num_cols,
+                            )
+                        );
+
+                        // Split into rows, adding random salt columns if needed
+                        if salt_size == 0 {
+                            (0..lde_size)
+                                .into_par_iter()
+                                .map(|row| {
+                                    let start = row * num_cols;
+                                    all_leaf_data[start..start + num_cols].to_vec()
+                                })
+                                .collect()
+                        } else {
+                            (0..lde_size)
+                                .into_par_iter()
+                                .map(|row| {
+                                    let start = row * num_cols;
+                                    let mut row_data = Vec::with_capacity(num_cols);
+                                    row_data.extend_from_slice(&all_leaf_data[start..start + num_polys]);
+                                    for _ in 0..salt_size {
+                                        row_data.push(F::rand());
+                                    }
+                                    row_data
+                                })
+                                .collect()
+                        }
                     }
                 );
-
-                let mut leaves = transpose(&lde_values);
-                reverse_index_bits_in_place(&mut leaves);
 
                 let merkle_tree = plonky2::maybe_await!(
                     <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)
@@ -851,7 +1031,7 @@ macro_rules! impl_webgpu_prover_compute {
                         let ctx_guard = crate::context::acquire_context()?;
                         let ctx = &*ctx_guard;
 
-                        let transposed = transpose(&pre_transposed_quotient_polys);
+                        let transposed = plonky2::util::transpose(&pre_transposed_quotient_polys);
                         let value_slices: Vec<&[GoldilocksField]> =
                             transposed.iter().map(|v| v.as_slice()).collect();
 
@@ -971,6 +1151,123 @@ mod tests {
             let mont = utils::to_mont(val.0);
             let back = utils::from_mont(mont);
             assert_eq!(val.0, back, "Montgomery round-trip failed for {}", val.0);
+        }
+    }
+
+    #[test]
+    fn test_gpu_mont_convert_consistency() {
+        // Test that GPU-side Montgomery conversion matches CPU-side
+        let ctx_guard = crate::context::acquire_context().expect("Failed to get WebGPU context");
+        let ctx = &*ctx_guard;
+
+        let n = 4096;
+        let data: Vec<GoldilocksField> = GoldilocksField::rand_vec(n);
+
+        // Upload raw data
+        let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mont_test"),
+            size: (n * 8) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, n * 8)
+            };
+            buffer.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
+        }
+        buffer.unmap();
+
+        // GPU: to_mont then from_mont (round-trip)
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mont_test_encoder"),
+        });
+        fft::encode_mont_convert(ctx, &mut encoder, &buffer, n, 1, 0); // to_mont
+        fft::encode_mont_convert(ctx, &mut encoder, &buffer, n, 1, 1); // from_mont
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let result = utils::download_field_data(&ctx.device, &ctx.queue, &buffer, n);
+        assert_eq!(data, result, "GPU Montgomery round-trip failed");
+    }
+
+    #[test]
+    fn test_gpu_transpose_consistency() {
+        // Test that GPU transpose + bit_reverse matches CPU transpose + reverse_index_bits_in_place
+        let ctx_guard = crate::context::acquire_context().expect("Failed to get WebGPU context");
+        let ctx = &*ctx_guard;
+
+        let log_lde_size = 12;
+        let lde_size = 1 << log_lde_size;
+        let num_polys = 8;
+
+        // Generate random polynomial data
+        let poly_data: Vec<Vec<GoldilocksField>> = (0..num_polys)
+            .map(|_| GoldilocksField::rand_vec(lde_size))
+            .collect();
+
+        // CPU reference: transpose + bit_reverse
+        let lde_refs: Vec<Vec<F>> = poly_data.clone();
+        let mut cpu_leaves = plonky2::util::transpose(&lde_refs);
+        plonky2_util::reverse_index_bits_in_place(&mut cpu_leaves);
+
+        // GPU: upload poly-major data, transpose + bit_reverse
+        let src_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("transpose_test_src"),
+            size: (num_polys * lde_size * 8) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = src_buffer.slice(..).get_mapped_range_mut();
+            for (i, poly) in poly_data.iter().enumerate() {
+                let offset = i * lde_size * 8;
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(poly.as_ptr() as *const u8, lde_size * 8)
+                };
+                mapped[offset..offset + lde_size * 8].copy_from_slice(bytes);
+            }
+        }
+        src_buffer.unmap();
+
+        let dst_buffer = utils::create_storage_buffer(
+            &ctx.device,
+            (lde_size * num_polys * 8) as u64,
+            "transpose_test_dst",
+        );
+
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("transpose_test_encoder"),
+        });
+        fft::encode_transpose_and_bit_reverse(
+            ctx,
+            &mut encoder,
+            &src_buffer,
+            &dst_buffer,
+            lde_size,
+            num_polys,
+            num_polys,
+            log_lde_size,
+        );
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let gpu_data = utils::download_field_data(
+            &ctx.device,
+            &ctx.queue,
+            &dst_buffer,
+            lde_size * num_polys,
+        );
+
+        // Compare row by row
+        for row in 0..lde_size {
+            let start = row * num_polys;
+            let gpu_row = &gpu_data[start..start + num_polys];
+            assert_eq!(
+                gpu_row, cpu_leaves[row].as_slice(),
+                "Transpose mismatch at row {}",
+                row
+            );
         }
     }
 

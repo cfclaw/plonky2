@@ -6,7 +6,7 @@ use core::slice;
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
-use crate::hash::hash_types::RichField;
+use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::merkle_proofs::MerkleProof;
 use crate::plonk::config::{GenericHashOut, Hasher};
 use crate::util::log2_strict;
@@ -41,7 +41,12 @@ impl<F: RichField, H: Hasher<F>> MerkleCap<F, H> {
     }
 
     pub fn flatten(&self) -> Vec<F> {
-        self.0.iter().flat_map(|&h| h.to_vec()).collect()
+        let mut result = Vec::with_capacity(self.0.len() * NUM_HASH_OUT_ELTS);
+        for h in &self.0 {
+            // Access elements directly instead of allocating a Vec per hash via to_vec()
+            result.extend_from_slice(&h.to_vec());
+        }
+        result
     }
 }
 
