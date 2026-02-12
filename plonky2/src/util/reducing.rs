@@ -83,15 +83,22 @@ impl<F: Field> ReducingFactor<F> {
     pub fn reduce_polys_base<BF: Extendable<D, Extension = F>, const D: usize>(
         &mut self,
         polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>>>,
-    ) -> PolynomialCoeffs<F> {
-        self.base
-            .powers()
-            .zip(polys)
-            .map(|(base_power, poly)| {
-                self.count += 1;
-                poly.borrow().mul_extension(base_power)
-            })
-            .sum()
+    ) -> PolynomialCoeffs<F>
+    where
+        F: FieldExtension<D, BaseField = BF>,
+    {
+        let mut result_coeffs: Vec<F> = Vec::new();
+        for (base_power, poly) in self.base.powers().zip(polys) {
+            self.count += 1;
+            let coeffs = &poly.borrow().coeffs;
+            if result_coeffs.len() < coeffs.len() {
+                result_coeffs.resize(coeffs.len(), F::ZERO);
+            }
+            for (r, &c) in result_coeffs.iter_mut().zip(coeffs.iter()) {
+                *r += base_power.scalar_mul(c);
+            }
+        }
+        PolynomialCoeffs::new(result_coeffs)
     }
 
     pub fn shift(&mut self, x: F) -> F {

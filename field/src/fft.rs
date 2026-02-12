@@ -184,10 +184,21 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
     // first r rounds of the FFT when there are 2^r zeros at the end
     // of the original input.
     if r > 0 {
-        // if r == 0 then this loop is a noop.
-        let mask = !((1 << r) - 1);
-        for i in 0..n {
-            values[i] = values[i & mask];
+        // Replicate each non-zero value into its block of 2^r elements.
+        // After reverse_index_bits, non-zero values sit at indices 0, 2^r, 2*2^r, ...
+        // Copy each value to the subsequent 2^r - 1 positions using doubling memcpy.
+        let block = 1 << r;
+        // First, fill the second element of each block.
+        for i in (0..n).step_by(block) {
+            values[i + 1] = values[i];
+        }
+        // Then double the filled region: copy 1→2, 2→4, 4→8, ... until block is full.
+        let mut width = 2;
+        while width < block {
+            for i in (0..n).step_by(block) {
+                values.copy_within(i..i + width, i + width);
+            }
+            width *= 2;
         }
     }
 

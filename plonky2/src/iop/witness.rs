@@ -375,8 +375,9 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
     pub fn full_witness(self) -> MatrixWitness<F> {
         let mut wire_values = vec![vec![F::ZERO; self.degree]; self.num_wires];
-        for i in 0..self.degree {
-            for j in 0..self.num_wires {
+        // Iterate column-first so writes to wire_values[j] are sequential.
+        for j in 0..self.num_wires {
+            for i in 0..self.degree {
                 let idx = i * self.num_wires + j;
                 let rep = self.representative_map[idx];
                 if let Some(v) = self.values[rep] {

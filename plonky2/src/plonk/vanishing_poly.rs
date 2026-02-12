@@ -228,15 +228,20 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         Vec::new()
     };
 
+    let sel_start = common_data.selectors_info.num_selectors();
+    let num_lk_sel = common_data.num_lookup_selectors;
+    let mut lookup_selectors_buf: Vec<F> = vec![F::ZERO; num_lk_sel];
+
     let mut res_batch: Vec<Vec<F>> = Vec::with_capacity(n);
     for k in 0..n {
         let index = indices_batch[k];
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 
-        let lookup_selectors: Vec<F> = (0..common_data.num_lookup_selectors)
-            .map(|i| vars.local_constants[common_data.selectors_info.num_selectors() + i])
-            .collect();
+        for i in 0..num_lk_sel {
+            lookup_selectors_buf[i] = vars.local_constants[sel_start + i];
+        }
+        let lookup_selectors = &lookup_selectors_buf[..];
 
         let local_zs = local_zs_batch[k];
         let next_zs = next_zs_batch[k];
