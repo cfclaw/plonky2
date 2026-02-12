@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 use serde::Serialize;
 
@@ -33,6 +34,17 @@ use plonky2::util::timing::TimingTree;
 use plonky2_hw_acc_webgpu::prover::PoseidonGoldilocksWebGpuConfig;
 use log::Level;
 
+// Concrete type aliases for circuit state caching
+type CpuInner = DummyPsyTypeCCircuit<GoldilocksField, PoseidonGoldilocksConfig, 2>;
+type CpuRecursive = DummyPsyTypeCRecursiveVerifierCircuit<GoldilocksField, PoseidonGoldilocksConfig, 2>;
+type GpuInner = DummyPsyTypeCCircuit<GoldilocksField, PoseidonGoldilocksWebGpuConfig, 2>;
+type GpuRecursive = DummyPsyTypeCRecursiveVerifierCircuit<GoldilocksField, PoseidonGoldilocksWebGpuConfig, 2>;
+
+thread_local! {
+    static CPU_CIRCUITS: RefCell<Option<(CpuInner, CpuRecursive)>> = RefCell::new(None);
+    static GPU_CIRCUITS: RefCell<Option<(GpuInner, GpuRecursive)>> = RefCell::new(None);
+}
+
 #[wasm_bindgen]
 pub fn init() {
     console_error_panic_hook::set_once();
@@ -51,6 +63,26 @@ pub struct BenchmarkResult {
     pub inner_proof_1_ms: f64,
     pub inner_proof_2_ms: f64,
     pub recursive_circuit_build_ms: f64,
+    pub recursive_proof_ms: f64,
+    pub verification_ms: f64,
+    pub total_ms: f64,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CircuitInitResult {
+    pub circuit_build_ms: f64,
+    pub recursive_circuit_build_ms: f64,
+    pub total_ms: f64,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ProofResult {
+    pub inner_proof_1_ms: f64,
+    pub inner_proof_2_ms: f64,
     pub recursive_proof_ms: f64,
     pub verification_ms: f64,
     pub total_ms: f64,
@@ -254,73 +286,86 @@ where
     }
 }
 
-async fn run_benchmark_inner<C: GenericConfig<2, F = GoldilocksField>>() -> Result<BenchmarkResult, String>
+// Phase 1: Build both circuits, return them with timing
+fn build_circuits_inner<C: GenericConfig<2, F = GoldilocksField>>() -> (
+    DummyPsyTypeCCircuit<GoldilocksField, C, 2>,
+    DummyPsyTypeCRecursiveVerifierCircuit<GoldilocksField, C, 2>,
+    CircuitInitResult,
+)
 where
     C::Hasher: AlgebraicHasher<GoldilocksField>,
 {
-    const D: usize = 2;
-    type F = GoldilocksField;
-
     let total_start = now_ms();
-
-    // 1. Build inner circuit
-    let t = now_ms();
     let config = CircuitConfig::standard_recursion_config();
-    let dummy_inner = DummyPsyTypeCCircuit::<F, C, D>::new(&config);
+
+    let t = now_ms();
+    let inner = DummyPsyTypeCCircuit::<GoldilocksField, C, 2>::new(&config);
     let circuit_build_ms = now_ms() - t;
 
-    // 2. Generate inner proof 1
     let t = now_ms();
-    let dummy_proof_1 = dummy_inner
+    let recursive = DummyPsyTypeCRecursiveVerifierCircuit::<GoldilocksField, C, 2>::new(
+        &config,
+        inner.circuit_data.verifier_only.constants_sigmas_cap.height(),
+        &inner.circuit_data.common,
+    );
+    let recursive_circuit_build_ms = now_ms() - t;
+
+    let result = CircuitInitResult {
+        circuit_build_ms,
+        recursive_circuit_build_ms,
+        total_ms: now_ms() - total_start,
+        success: true,
+        error: None,
+    };
+
+    (inner, recursive, result)
+}
+
+// Phase 2: Generate proofs and verify using pre-built circuits
+async fn run_proofs_inner<C: GenericConfig<2, F = GoldilocksField>>(
+    inner: &DummyPsyTypeCCircuit<GoldilocksField, C, 2>,
+    recursive: &DummyPsyTypeCRecursiveVerifierCircuit<GoldilocksField, C, 2>,
+) -> Result<ProofResult, String>
+where
+    C::Hasher: AlgebraicHasher<GoldilocksField>,
+{
+    let total_start = now_ms();
+
+    let t = now_ms();
+    let dummy_proof_1 = inner
         .prove(HashOut::rand())
         .await
         .map_err(|e| format!("Inner proof 1 failed: {}", e))?;
     let inner_proof_1_ms = now_ms() - t;
 
-    // 3. Generate inner proof 2
     let t = now_ms();
-    let dummy_proof_2 = dummy_inner
+    let dummy_proof_2 = inner
         .prove(HashOut::rand())
         .await
         .map_err(|e| format!("Inner proof 2 failed: {}", e))?;
     let inner_proof_2_ms = now_ms() - t;
 
-    // 4. Build recursive circuit
     let t = now_ms();
-    let dummy_recursive = DummyPsyTypeCRecursiveVerifierCircuit::<F, C, D>::new(
-        &config,
-        dummy_inner
-            .circuit_data
-            .verifier_only
-            .constants_sigmas_cap
-            .height(),
-        &dummy_inner.circuit_data.common,
-    );
-    let recursive_circuit_build_ms = now_ms() - t;
-
-    // 5. Generate recursive proof
-    let t = now_ms();
-    let recursive_proof = dummy_recursive
+    let recursive_proof = recursive
         .prove(
             &dummy_proof_1,
             &dummy_proof_2,
-            &dummy_inner.circuit_data.verifier_only,
+            &inner.circuit_data.verifier_only,
         )
         .await
         .map_err(|e| format!("Recursive proof failed: {}", e))?;
     let recursive_proof_ms = now_ms() - t;
 
-    // 6. Verify all proofs
     let t = now_ms();
-    dummy_inner
+    inner
         .circuit_data
         .verify(dummy_proof_1)
         .map_err(|e| format!("Inner proof 1 verification failed: {}", e))?;
-    dummy_inner
+    inner
         .circuit_data
         .verify(dummy_proof_2)
         .map_err(|e| format!("Inner proof 2 verification failed: {}", e))?;
-    dummy_recursive
+    recursive
         .circuit_data
         .verify(recursive_proof.clone())
         .map_err(|e| format!("Recursive proof verification failed: {}", e))?;
@@ -328,23 +373,42 @@ where
     for _ in 0..9 {
         verify_proof_borrowed(
             &recursive_proof,
-            &dummy_recursive.circuit_data.verifier_only,
-            &dummy_recursive.circuit_data.common,
+            &recursive.circuit_data.verifier_only,
+            &recursive.circuit_data.common,
         )
         .map_err(|e| format!("Repeated verification failed: {}", e))?;
     }
     let verification_ms = now_ms() - t;
 
-    let total_ms = now_ms() - total_start;
-
-    Ok(BenchmarkResult {
-        circuit_build_ms,
+    Ok(ProofResult {
         inner_proof_1_ms,
         inner_proof_2_ms,
-        recursive_circuit_build_ms,
         recursive_proof_ms,
         verification_ms,
-        total_ms,
+        total_ms: now_ms() - total_start,
+        success: true,
+        error: None,
+    })
+}
+
+// Combined benchmark (calls both phases, no caching)
+async fn run_benchmark_inner<C: GenericConfig<2, F = GoldilocksField>>() -> Result<BenchmarkResult, String>
+where
+    C::Hasher: AlgebraicHasher<GoldilocksField>,
+{
+    let total_start = now_ms();
+
+    let (inner, recursive, init_result) = build_circuits_inner::<C>();
+    let proof_result = run_proofs_inner::<C>(&inner, &recursive).await?;
+
+    Ok(BenchmarkResult {
+        circuit_build_ms: init_result.circuit_build_ms,
+        inner_proof_1_ms: proof_result.inner_proof_1_ms,
+        inner_proof_2_ms: proof_result.inner_proof_2_ms,
+        recursive_circuit_build_ms: init_result.recursive_circuit_build_ms,
+        recursive_proof_ms: proof_result.recursive_proof_ms,
+        verification_ms: proof_result.verification_ms,
+        total_ms: now_ms() - total_start,
         success: true,
         error: None,
     })
@@ -364,6 +428,30 @@ fn error_result(e: String) -> BenchmarkResult {
     }
 }
 
+fn init_error_result(e: String) -> CircuitInitResult {
+    CircuitInitResult {
+        circuit_build_ms: 0.0,
+        recursive_circuit_build_ms: 0.0,
+        total_ms: 0.0,
+        success: false,
+        error: Some(e),
+    }
+}
+
+fn proof_error_result(e: String) -> ProofResult {
+    ProofResult {
+        inner_proof_1_ms: 0.0,
+        inner_proof_2_ms: 0.0,
+        recursive_proof_ms: 0.0,
+        verification_ms: 0.0,
+        total_ms: 0.0,
+        success: false,
+        error: Some(e),
+    }
+}
+
+// --- Legacy combined benchmarks ---
+
 #[wasm_bindgen]
 pub async fn run_cpu_benchmark() -> JsValue {
     let result = match run_benchmark_inner::<PoseidonGoldilocksConfig>().await {
@@ -379,5 +467,89 @@ pub async fn run_webgpu_benchmark() -> JsValue {
         Ok(r) => r,
         Err(e) => error_result(e),
     };
+    serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+}
+
+// --- Two-phase API: build circuits (cached in thread_local) ---
+
+#[wasm_bindgen]
+pub fn build_circuits_cpu() -> JsValue {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (inner, recursive, result) = build_circuits_inner::<PoseidonGoldilocksConfig>();
+        CPU_CIRCUITS.with(|c| *c.borrow_mut() = Some((inner, recursive)));
+        result
+    }));
+    match result {
+        Ok(r) => serde_wasm_bindgen::to_value(&r).unwrap_or(JsValue::NULL),
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "Unknown panic during circuit build".to_string()
+            };
+            serde_wasm_bindgen::to_value(&init_error_result(msg)).unwrap_or(JsValue::NULL)
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub fn build_circuits_webgpu() -> JsValue {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (inner, recursive, result) = build_circuits_inner::<PoseidonGoldilocksWebGpuConfig>();
+        GPU_CIRCUITS.with(|c| *c.borrow_mut() = Some((inner, recursive)));
+        result
+    }));
+    match result {
+        Ok(r) => serde_wasm_bindgen::to_value(&r).unwrap_or(JsValue::NULL),
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "Unknown panic during circuit build".to_string()
+            };
+            serde_wasm_bindgen::to_value(&init_error_result(msg)).unwrap_or(JsValue::NULL)
+        }
+    }
+}
+
+// --- Two-phase API: run proofs (using cached circuits) ---
+
+#[wasm_bindgen]
+pub async fn run_proofs_cpu() -> JsValue {
+    let circuits = CPU_CIRCUITS.with(|c| c.borrow_mut().take());
+    let Some((inner, recursive)) = circuits else {
+        return serde_wasm_bindgen::to_value(&proof_error_result(
+            "Circuits not initialized. Call build_circuits_cpu first.".into(),
+        ))
+        .unwrap_or(JsValue::NULL);
+    };
+    let result = match run_proofs_inner::<PoseidonGoldilocksConfig>(&inner, &recursive).await {
+        Ok(r) => r,
+        Err(e) => proof_error_result(e),
+    };
+    // Put circuits back for reuse
+    CPU_CIRCUITS.with(|c| *c.borrow_mut() = Some((inner, recursive)));
+    serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+}
+
+#[wasm_bindgen]
+pub async fn run_proofs_webgpu() -> JsValue {
+    let circuits = GPU_CIRCUITS.with(|c| c.borrow_mut().take());
+    let Some((inner, recursive)) = circuits else {
+        return serde_wasm_bindgen::to_value(&proof_error_result(
+            "Circuits not initialized. Call build_circuits_webgpu first.".into(),
+        ))
+        .unwrap_or(JsValue::NULL);
+    };
+    let result = match run_proofs_inner::<PoseidonGoldilocksWebGpuConfig>(&inner, &recursive).await {
+        Ok(r) => r,
+        Err(e) => proof_error_result(e),
+    };
+    // Put circuits back for reuse
+    GPU_CIRCUITS.with(|c| *c.borrow_mut() = Some((inner, recursive)));
     serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
 }

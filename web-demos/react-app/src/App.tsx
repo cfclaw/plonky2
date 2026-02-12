@@ -1,10 +1,16 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 
-interface BenchmarkResult {
+interface CircuitInitResult {
   circuit_build_ms: number;
+  recursive_circuit_build_ms: number;
+  total_ms: number;
+  success: boolean;
+  error?: string;
+}
+
+interface ProofResult {
   inner_proof_1_ms: number;
   inner_proof_2_ms: number;
-  recursive_circuit_build_ms: number;
   recursive_proof_ms: number;
   verification_ms: number;
   total_ms: number;
@@ -27,21 +33,42 @@ function speedup(cpu: number, gpu: number): string {
   return `${(1 / ratio).toFixed(2)}x slower`;
 }
 
-const PHASES = [
-  { key: 'circuit_build_ms', label: 'Inner Circuit Build' },
-  { key: 'inner_proof_1_ms', label: 'Inner Proof #1' },
-  { key: 'inner_proof_2_ms', label: 'Inner Proof #2' },
-  { key: 'recursive_circuit_build_ms', label: 'Recursive Circuit Build' },
-  { key: 'recursive_proof_ms', label: 'Recursive Proof' },
-  { key: 'verification_ms', label: 'Verification (3+9 proofs)' },
-  { key: 'total_ms', label: 'Total' },
-] as const;
+type PhaseSource = 'init' | 'proof';
+
+const PHASES: { key: string; label: string; source: PhaseSource }[] = [
+  { key: 'circuit_build_ms', label: 'Inner Circuit Build', source: 'init' },
+  { key: 'recursive_circuit_build_ms', label: 'Recursive Circuit Build', source: 'init' },
+  { key: 'inner_proof_1_ms', label: 'Inner Proof #1', source: 'proof' },
+  { key: 'inner_proof_2_ms', label: 'Inner Proof #2', source: 'proof' },
+  { key: 'recursive_proof_ms', label: 'Recursive Proof', source: 'proof' },
+  { key: 'verification_ms', label: 'Verification (3+9 proofs)', source: 'proof' },
+];
+
+function getPhaseValue(
+  source: PhaseSource,
+  key: string,
+  initResult: CircuitInitResult | null,
+  proofResult: ProofResult | null,
+): number | null {
+  const result = source === 'init' ? initResult : proofResult;
+  if (!result) return null;
+  return (result as any)[key] as number;
+}
+
+function totalMs(
+  initResult: CircuitInitResult | null,
+  proofResult: ProofResult | null,
+): number {
+  return (initResult?.total_ms ?? 0) + (proofResult?.total_ms ?? 0);
+}
 
 export default function App() {
   const [cpuState, setCpuState] = useState<RunState>('idle');
   const [gpuState, setGpuState] = useState<RunState>('idle');
-  const [cpuResult, setCpuResult] = useState<BenchmarkResult | null>(null);
-  const [gpuResult, setGpuResult] = useState<BenchmarkResult | null>(null);
+  const [cpuInitResult, setCpuInitResult] = useState<CircuitInitResult | null>(null);
+  const [cpuProofResult, setCpuProofResult] = useState<ProofResult | null>(null);
+  const [gpuInitResult, setGpuInitResult] = useState<CircuitInitResult | null>(null);
+  const [gpuProofResult, setGpuProofResult] = useState<ProofResult | null>(null);
   const [cpuStatus, setCpuStatus] = useState('');
   const [gpuStatus, setGpuStatus] = useState('');
   const [hasWebGPU, setHasWebGPU] = useState<boolean | null>(null);
@@ -50,7 +77,7 @@ export default function App() {
   const gpuWorkerRef = useRef<Worker | null>(null);
 
   // Check WebGPU support on mount
-  React.useEffect(() => {
+  useEffect(() => {
     const check = async () => {
       if ('gpu' in navigator) {
         try {
@@ -64,76 +91,119 @@ export default function App() {
       }
     };
     check();
+    return () => {
+      cpuWorkerRef.current?.terminate();
+      gpuWorkerRef.current?.terminate();
+    };
+  }, []);
+
+  const getOrCreateCpuWorker = useCallback(() => {
+    if (!cpuWorkerRef.current) {
+      const worker = new Worker(
+        new URL('./workers/cpu-worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+      worker.onmessage = (e: MessageEvent) => {
+        if (e.data.type === 'status') {
+          setCpuStatus(e.data.status);
+        } else if (e.data.type === 'init_result') {
+          const result = e.data.result as CircuitInitResult;
+          setCpuInitResult(result);
+          if (!result.success) {
+            setCpuState('error');
+            setCpuStatus(`Error: ${result.error}`);
+          }
+        } else if (e.data.type === 'proof_result') {
+          const result = e.data.result as ProofResult;
+          setCpuProofResult(result);
+          setCpuState(result.success ? 'done' : 'error');
+          setCpuStatus(result.success ? 'Complete' : `Error: ${result.error}`);
+        } else if (e.data.type === 'error') {
+          setCpuState('error');
+          setCpuStatus(e.data.error);
+        }
+      };
+      worker.onerror = (err) => {
+        setCpuState('error');
+        setCpuStatus(`Worker error: ${err.message}`);
+      };
+      cpuWorkerRef.current = worker;
+    }
+    return cpuWorkerRef.current;
+  }, []);
+
+  const getOrCreateGpuWorker = useCallback(() => {
+    if (!gpuWorkerRef.current) {
+      const worker = new Worker(
+        new URL('./workers/webgpu-worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+      worker.onmessage = (e: MessageEvent) => {
+        if (e.data.type === 'status') {
+          setGpuStatus(e.data.status);
+        } else if (e.data.type === 'init_result') {
+          const result = e.data.result as CircuitInitResult;
+          setGpuInitResult(result);
+          if (!result.success) {
+            setGpuState('error');
+            setGpuStatus(`Error: ${result.error}`);
+          }
+        } else if (e.data.type === 'proof_result') {
+          const result = e.data.result as ProofResult;
+          setGpuProofResult(result);
+          setGpuState(result.success ? 'done' : 'error');
+          setGpuStatus(result.success ? 'Complete' : `Error: ${result.error}`);
+        } else if (e.data.type === 'error') {
+          setGpuState('error');
+          setGpuStatus(e.data.error);
+        }
+      };
+      worker.onerror = (err) => {
+        setGpuState('error');
+        setGpuStatus(`Worker error: ${err.message}`);
+      };
+      gpuWorkerRef.current = worker;
+    }
+    return gpuWorkerRef.current;
   }, []);
 
   const runCpu = useCallback(() => {
     setCpuState('running');
-    setCpuResult(null);
+    setCpuInitResult(null);
+    setCpuProofResult(null);
     setCpuStatus('Starting...');
+    getOrCreateCpuWorker().postMessage({ type: 'run' });
+  }, [getOrCreateCpuWorker]);
 
-    const worker = new Worker(
-      new URL('./workers/cpu-worker.ts', import.meta.url),
-      { type: 'module' }
-    );
-    cpuWorkerRef.current = worker;
-
-    worker.onmessage = (e: MessageEvent) => {
-      if (e.data.type === 'status') {
-        setCpuStatus(e.data.status);
-      } else if (e.data.type === 'result') {
-        const result = e.data.result as BenchmarkResult;
-        setCpuResult(result);
-        setCpuState(result.success ? 'done' : 'error');
-        setCpuStatus(result.success ? 'Complete' : `Error: ${result.error}`);
-        worker.terminate();
-      }
-    };
-
-    worker.onerror = (err) => {
-      setCpuState('error');
-      setCpuStatus(`Worker error: ${err.message}`);
-      worker.terminate();
-    };
-
-    worker.postMessage({ type: 'run' });
-  }, []);
+  const rerunCpuProofs = useCallback(() => {
+    setCpuState('running');
+    setCpuProofResult(null);
+    setCpuStatus('Re-running proofs...');
+    getOrCreateCpuWorker().postMessage({ type: 'prove' });
+  }, [getOrCreateCpuWorker]);
 
   const runGpu = useCallback(() => {
     setGpuState('running');
-    setGpuResult(null);
+    setGpuInitResult(null);
+    setGpuProofResult(null);
     setGpuStatus('Starting...');
+    getOrCreateGpuWorker().postMessage({ type: 'run' });
+  }, [getOrCreateGpuWorker]);
 
-    const worker = new Worker(
-      new URL('./workers/webgpu-worker.ts', import.meta.url),
-      { type: 'module' }
-    );
-    gpuWorkerRef.current = worker;
-
-    worker.onmessage = (e: MessageEvent) => {
-      if (e.data.type === 'status') {
-        setGpuStatus(e.data.status);
-      } else if (e.data.type === 'result') {
-        const result = e.data.result as BenchmarkResult;
-        setGpuResult(result);
-        setGpuState(result.success ? 'done' : 'error');
-        setGpuStatus(result.success ? 'Complete' : `Error: ${result.error}`);
-        worker.terminate();
-      }
-    };
-
-    worker.onerror = (err) => {
-      setGpuState('error');
-      setGpuStatus(`Worker error: ${err.message}`);
-      worker.terminate();
-    };
-
-    worker.postMessage({ type: 'run' });
-  }, []);
+  const rerunGpuProofs = useCallback(() => {
+    setGpuState('running');
+    setGpuProofResult(null);
+    setGpuStatus('Re-running proofs...');
+    getOrCreateGpuWorker().postMessage({ type: 'prove' });
+  }, [getOrCreateGpuWorker]);
 
   const runBoth = useCallback(() => {
     runCpu();
     if (hasWebGPU) runGpu();
   }, [runCpu, runGpu, hasWebGPU]);
+
+  const cpuInitDone = cpuInitResult?.success === true;
+  const gpuInitDone = gpuInitResult?.success === true;
 
   return (
     <div style={{ fontFamily: 'monospace', maxWidth: 900, margin: '0 auto', padding: 20 }}>
@@ -159,20 +229,34 @@ export default function App() {
         </span>
       </div>
 
-      <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
         <button
           onClick={runCpu}
           disabled={cpuState === 'running'}
           style={btnStyle}
         >
-          {cpuState === 'running' ? 'Running CPU...' : 'Run CPU Only'}
+          {cpuState === 'running' ? 'Running CPU...' : 'Run CPU'}
+        </button>
+        <button
+          onClick={rerunCpuProofs}
+          disabled={cpuState === 'running' || !cpuInitDone}
+          style={{ ...btnStyle, background: cpuInitDone ? '#555' : '#999' }}
+        >
+          Re-run CPU Proofs
         </button>
         <button
           onClick={runGpu}
           disabled={gpuState === 'running' || !hasWebGPU}
           style={btnStyle}
         >
-          {gpuState === 'running' ? 'Running WebGPU...' : 'Run WebGPU Only'}
+          {gpuState === 'running' ? 'Running WebGPU...' : 'Run WebGPU'}
+        </button>
+        <button
+          onClick={rerunGpuProofs}
+          disabled={gpuState === 'running' || !gpuInitDone}
+          style={{ ...btnStyle, background: gpuInitDone ? '#555' : '#999' }}
+        >
+          Re-run GPU Proofs
         </button>
         <button
           onClick={runBoth}
@@ -210,34 +294,88 @@ export default function App() {
           </tr>
         </thead>
         <tbody>
-          {PHASES.map(({ key, label }) => (
-            <tr key={key} style={{ borderBottom: '1px solid #ddd' }}>
-              <td style={tdStyle}>{label}</td>
-              <td style={{ ...tdStyle, textAlign: 'right' }}>
-                {cpuResult ? formatMs((cpuResult as any)[key]) : '-'}
-              </td>
-              <td style={{ ...tdStyle, textAlign: 'right' }}>
-                {gpuResult ? formatMs((gpuResult as any)[key]) : '-'}
-              </td>
-              <td style={{ ...tdStyle, textAlign: 'right', fontWeight: key === 'total_ms' ? 'bold' : 'normal' }}>
-                {cpuResult && gpuResult
-                  ? speedup((cpuResult as any)[key], (gpuResult as any)[key])
-                  : '-'}
-              </td>
-            </tr>
-          ))}
+          {/* Init phases header */}
+          <tr>
+            <td colSpan={4} style={{ ...tdStyle, fontWeight: 'bold', background: '#f5f5f5', fontSize: 12, color: '#666' }}>
+              Phase 1: Circuit Building {cpuInitDone || gpuInitDone ? '(cached)' : ''}
+            </td>
+          </tr>
+          {PHASES.filter(p => p.source === 'init').map(({ key, label, source }) => {
+            const cpuVal = getPhaseValue(source, key, cpuInitResult, cpuProofResult);
+            const gpuVal = getPhaseValue(source, key, gpuInitResult, gpuProofResult);
+            return (
+              <tr key={key} style={{ borderBottom: '1px solid #ddd' }}>
+                <td style={tdStyle}>{label}</td>
+                <td style={{ ...tdStyle, textAlign: 'right' }}>
+                  {cpuVal !== null ? formatMs(cpuVal) : '-'}
+                </td>
+                <td style={{ ...tdStyle, textAlign: 'right' }}>
+                  {gpuVal !== null ? formatMs(gpuVal) : '-'}
+                </td>
+                <td style={{ ...tdStyle, textAlign: 'right' }}>
+                  {cpuVal !== null && gpuVal !== null ? speedup(cpuVal, gpuVal) : '-'}
+                </td>
+              </tr>
+            );
+          })}
+          {/* Proof phases header */}
+          <tr>
+            <td colSpan={4} style={{ ...tdStyle, fontWeight: 'bold', background: '#f5f5f5', fontSize: 12, color: '#666' }}>
+              Phase 2: Proving &amp; Verification
+            </td>
+          </tr>
+          {PHASES.filter(p => p.source === 'proof').map(({ key, label, source }) => {
+            const cpuVal = getPhaseValue(source, key, cpuInitResult, cpuProofResult);
+            const gpuVal = getPhaseValue(source, key, gpuInitResult, gpuProofResult);
+            return (
+              <tr key={key} style={{ borderBottom: '1px solid #ddd' }}>
+                <td style={tdStyle}>{label}</td>
+                <td style={{ ...tdStyle, textAlign: 'right' }}>
+                  {cpuVal !== null ? formatMs(cpuVal) : '-'}
+                </td>
+                <td style={{ ...tdStyle, textAlign: 'right' }}>
+                  {gpuVal !== null ? formatMs(gpuVal) : '-'}
+                </td>
+                <td style={{ ...tdStyle, textAlign: 'right' }}>
+                  {cpuVal !== null && gpuVal !== null ? speedup(cpuVal, gpuVal) : '-'}
+                </td>
+              </tr>
+            );
+          })}
+          {/* Total row */}
+          <tr style={{ borderTop: '2px solid #333' }}>
+            <td style={{ ...tdStyle, fontWeight: 'bold' }}>Total</td>
+            <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 'bold' }}>
+              {cpuInitResult || cpuProofResult
+                ? formatMs(totalMs(cpuInitResult, cpuProofResult))
+                : '-'}
+            </td>
+            <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 'bold' }}>
+              {gpuInitResult || gpuProofResult
+                ? formatMs(totalMs(gpuInitResult, gpuProofResult))
+                : '-'}
+            </td>
+            <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 'bold' }}>
+              {(cpuInitResult || cpuProofResult) && (gpuInitResult || gpuProofResult)
+                ? speedup(
+                    totalMs(cpuInitResult, cpuProofResult),
+                    totalMs(gpuInitResult, gpuProofResult),
+                  )
+                : '-'}
+            </td>
+          </tr>
         </tbody>
       </table>
 
       {/* Errors */}
-      {cpuResult?.error && (
+      {(cpuInitResult?.error || cpuProofResult?.error) && (
         <div style={{ color: '#c44', marginTop: 12, whiteSpace: 'pre-wrap', fontSize: 12 }}>
-          <strong>CPU Error:</strong> {cpuResult.error}
+          <strong>CPU Error:</strong> {cpuInitResult?.error || cpuProofResult?.error}
         </div>
       )}
-      {gpuResult?.error && (
+      {(gpuInitResult?.error || gpuProofResult?.error) && (
         <div style={{ color: '#c44', marginTop: 12, whiteSpace: 'pre-wrap', fontSize: 12 }}>
-          <strong>WebGPU Error:</strong> {gpuResult.error}
+          <strong>WebGPU Error:</strong> {gpuInitResult?.error || gpuProofResult?.error}
         </div>
       )}
 
@@ -250,6 +388,7 @@ export default function App() {
           <li>Circuit build time is identical (CPU-only operation in both cases)</li>
           <li>WebGPU acceleration applies to proving (FFT, Merkle tree construction)</li>
           <li>Verification is always CPU (no GPU needed for verification)</li>
+          <li>After initial run, use "Re-run Proofs" to re-prove with cached circuits</li>
           <li>WebGPU requires Chrome 113+ or Edge 113+ with WebGPU enabled</li>
         </ul>
       </div>
