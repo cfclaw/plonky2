@@ -1,31 +1,37 @@
-import init, { init as initPanic, run_cpu_benchmark } from 'plonky2-wasm-webgpu';
+import init, { init as initPanic, build_circuits_cpu, run_proofs_cpu } from 'plonky2-wasm-webgpu';
+
+let wasmInitialized = false;
 
 self.onmessage = async (e: MessageEvent) => {
-  if (e.data.type === 'run') {
-    try {
-      self.postMessage({ type: 'status', status: 'Initializing WASM module...' });
-      await init();
-      initPanic();
+  try {
+    if (e.data.type === 'init' || e.data.type === 'run') {
+      if (!wasmInitialized) {
+        self.postMessage({ type: 'status', status: 'Initializing WASM module...' });
+        await init();
+        initPanic();
+        wasmInitialized = true;
+      }
 
-      self.postMessage({ type: 'status', status: 'Running CPU benchmark (this will take a while)...' });
-      const result = run_cpu_benchmark();
+      self.postMessage({ type: 'status', status: 'Building circuits...' });
+      const initResult = build_circuits_cpu();
+      self.postMessage({ type: 'init_result', result: initResult });
 
-      self.postMessage({ type: 'result', result });
-    } catch (err: any) {
-      self.postMessage({
-        type: 'result',
-        result: {
-          success: false,
-          error: `Worker error: ${err.message || err}`,
-          circuit_build_ms: 0,
-          inner_proof_1_ms: 0,
-          inner_proof_2_ms: 0,
-          recursive_circuit_build_ms: 0,
-          recursive_proof_ms: 0,
-          verification_ms: 0,
-          total_ms: 0,
-        },
-      });
+      if (!initResult.success) return;
+
+      if (e.data.type === 'run') {
+        self.postMessage({ type: 'status', status: 'Generating and verifying proofs...' });
+        const proofResult = await run_proofs_cpu();
+        self.postMessage({ type: 'proof_result', result: proofResult });
+      }
+    } else if (e.data.type === 'prove') {
+      self.postMessage({ type: 'status', status: 'Generating and verifying proofs...' });
+      const proofResult = await run_proofs_cpu();
+      self.postMessage({ type: 'proof_result', result: proofResult });
     }
+  } catch (err: any) {
+    self.postMessage({
+      type: 'error',
+      error: `Worker error: ${err.message || err}`,
+    });
   }
 };
