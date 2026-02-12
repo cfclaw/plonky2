@@ -16,6 +16,7 @@ use plonky2::gates::reducing::ReducingGate;
 use plonky2::gates::reducing_extension::ReducingExtensionGate;
 use plonky2::plonk::verifier_helper::verify_proof_borrowed;
 use plonky2_field::interpolation::barycentric_weights;
+use plonky2_field::goldilocks_field::GoldilocksField;
 use plonky2_field::types::Sample;
 use plonky2_field::extension::Extendable;
 
@@ -25,7 +26,7 @@ use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::config::{AlgebraicHasher, GenericConfig};
+use plonky2::plonk::config::{AlgebraicHasher, GenericConfig, PoseidonGoldilocksConfig};
 use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
 use plonky2::plonk::prover::prove;
 use plonky2::util::timing::TimingTree;
@@ -164,7 +165,7 @@ where
     ) -> anyhow::Result<ProofWithPublicInputs<F, C, D>> {
         let mut pw = PartialWitness::new();
         pw.set_hash_target(self.dummy_public_inputs, dummy_public_inputs)?;
-        let mut timing = TimingTree::new("prove dummy psy type c (WebGPU/WASM)", Level::Debug);
+        let mut timing = TimingTree::new("prove dummy psy type c", Level::Debug);
         let proof = prove::<F, C, D>(
             &self.circuit_data.prover_only,
             &self.circuit_data.common,
@@ -242,7 +243,7 @@ where
         pw.set_verifier_data_target(&self.proof_b_verifier_data_target, verifier_data)?;
         pw.set_proof_with_pis_target(&self.proof_a_target, left_proof)?;
         pw.set_proof_with_pis_target(&self.proof_b_target, right_proof)?;
-        let mut timing = TimingTree::new("prove recursive (WebGPU/WASM)", Level::Trace);
+        let mut timing = TimingTree::new("prove recursive", Level::Trace);
         let proof = prove::<F, C, D>(
             &self.circuit_data.prover_only,
             &self.circuit_data.common,
@@ -253,10 +254,12 @@ where
     }
 }
 
-async fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
+async fn run_benchmark_inner<C: GenericConfig<2, F = GoldilocksField>>() -> Result<BenchmarkResult, String>
+where
+    C::Hasher: AlgebraicHasher<GoldilocksField>,
+{
     const D: usize = 2;
-    type C = PoseidonGoldilocksWebGpuConfig;
-    type F = <C as GenericConfig<D>>::F;
+    type F = GoldilocksField;
 
     let total_start = now_ms();
 
@@ -347,21 +350,34 @@ async fn run_benchmark_inner() -> Result<BenchmarkResult, String> {
     })
 }
 
+fn error_result(e: String) -> BenchmarkResult {
+    BenchmarkResult {
+        circuit_build_ms: 0.0,
+        inner_proof_1_ms: 0.0,
+        inner_proof_2_ms: 0.0,
+        recursive_circuit_build_ms: 0.0,
+        recursive_proof_ms: 0.0,
+        verification_ms: 0.0,
+        total_ms: 0.0,
+        success: false,
+        error: Some(e),
+    }
+}
+
+#[wasm_bindgen]
+pub async fn run_cpu_benchmark() -> JsValue {
+    let result = match run_benchmark_inner::<PoseidonGoldilocksConfig>().await {
+        Ok(r) => r,
+        Err(e) => error_result(e),
+    };
+    serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+}
+
 #[wasm_bindgen]
 pub async fn run_webgpu_benchmark() -> JsValue {
-    let result = match run_benchmark_inner().await {
+    let result = match run_benchmark_inner::<PoseidonGoldilocksWebGpuConfig>().await {
         Ok(r) => r,
-        Err(e) => BenchmarkResult {
-            circuit_build_ms: 0.0,
-            inner_proof_1_ms: 0.0,
-            inner_proof_2_ms: 0.0,
-            recursive_circuit_build_ms: 0.0,
-            recursive_proof_ms: 0.0,
-            verification_ms: 0.0,
-            total_ms: 0.0,
-            success: false,
-            error: Some(e),
-        },
+        Err(e) => error_result(e),
     };
     serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
 }

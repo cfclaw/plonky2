@@ -1,4 +1,4 @@
-import init, { init as initPanic, run_cpu_benchmark } from 'plonky2-wasm-cpu';
+import init, { init as initPanic, run_cpu_benchmark } from 'plonky2-wasm-webgpu';
 
 self.onmessage = async (e: MessageEvent) => {
   if (e.data.type === 'run') {

@@ -11,7 +11,7 @@ export default defineConfig({
     },
   },
   optimizeDeps: {
-    exclude: ['plonky2-wasm-cpu', 'plonky2-wasm-webgpu'],
+    exclude: ['plonky2-wasm-webgpu'],
   },
   worker: {
     plugins: () => [wasm()],
