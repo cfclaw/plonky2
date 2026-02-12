@@ -11,6 +11,8 @@ const FFT_COSET_SCALE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/fft_c
 const FFT_DIT_PASS_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/fft_dit_pass.wgsl"));
 const BIT_REVERSE_COPY_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/bit_reverse_copy.wgsl"));
 const IFFT_REORDER_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/ifft_reorder.wgsl"));
+const MONT_CONVERT_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/mont_convert.wgsl"));
+const TRANSPOSE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/transpose.wgsl"));
 const MERKLE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/merkle.wgsl"));
 
 const MAX_DEGREE_LOG: usize = 18;
@@ -76,6 +78,10 @@ impl WebGpuContext {
         ctx.compile_pipeline("fft_dit_pass_batched", FFT_DIT_PASS_WGSL)?;
         ctx.compile_pipeline("bit_reverse_copy_batched", BIT_REVERSE_COPY_WGSL)?;
         ctx.compile_pipeline("ifft_reorder_and_scale_batched", IFFT_REORDER_WGSL)?;
+
+        // Compile utility pipelines (Montgomery conversion, transpose)
+        ctx.compile_pipeline("mont_convert_batched", MONT_CONVERT_WGSL)?;
+        ctx.compile_pipeline("transpose_and_bit_reverse", TRANSPOSE_WGSL)?;
 
         // Compile Merkle pipelines
         ctx.compile_pipeline("copy_row_leaves", MERKLE_WGSL)?;

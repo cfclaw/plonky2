@@ -52,8 +52,8 @@ pub fn upload_field_data(
     queue.write_buffer(buffer, offset, bytes);
 }
 
-/// Upload a slice of u64 values to a GPU buffer.
-pub fn upload_u64_data(
+/// Upload a slice of u64 values to a GPU buffer at an offset.
+pub fn upload_u64_data_at(
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
     offset: u64,
@@ -66,6 +66,25 @@ pub fn upload_u64_data(
         )
     };
     queue.write_buffer(buffer, offset, bytes);
+}
+
+/// Create a new GPU storage buffer and upload u64 data into it.
+pub fn upload_u64_data(device: &wgpu::Device, data: &[u64], label: &str) -> wgpu::Buffer {
+    let size_bytes = (data.len() * std::mem::size_of::<u64>()) as u64;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size_bytes,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
+    };
+    buffer.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
+    buffer.unmap();
+    buffer
 }
 
 /// Download data from a GPU buffer into a Vec<GoldilocksField>.
@@ -104,10 +123,18 @@ pub fn download_field_data(
     assert!(done.load(Ordering::SeqCst), "Buffer mapping did not complete");
 
     let data = buffer_slice.get_mapped_range();
-    let result: Vec<GoldilocksField> = unsafe {
-        let ptr = data.as_ptr() as *const GoldilocksField;
-        std::slice::from_raw_parts(ptr, num_elements).to_vec()
-    };
+    // Directly construct the Vec from the mapped bytes without an intermediate
+    // slice-to-vec copy. The mapped range is only valid until we drop `data`,
+    // so we copy once into a pre-allocated Vec.
+    let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr() as *const GoldilocksField,
+            result.as_mut_ptr(),
+            num_elements,
+        );
+        result.set_len(num_elements);
+    }
 
     drop(data);
     staging.unmap();
@@ -150,10 +177,16 @@ pub async fn download_field_data(
     device.poll(wgpu::Maintain::Wait);
 
     let bytes = rx.await.unwrap();
-    let result: Vec<GoldilocksField> = unsafe {
-        let ptr = bytes.as_ptr() as *const GoldilocksField;
-        std::slice::from_raw_parts(ptr, num_elements).to_vec()
-    };
+    // Construct Vec directly from bytes without an intermediate slice copy.
+    let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr() as *const GoldilocksField,
+            result.as_mut_ptr(),
+            num_elements,
+        );
+        result.set_len(num_elements);
+    }
 
     log_gpu("  [gpu] download: complete");
 
