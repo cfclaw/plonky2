@@ -392,6 +392,10 @@ mod fft {
                     utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * lde_size)
                 );
 
+                // Free GPU buffers immediately (critical for iOS Safari memory pressure)
+                _src_buffer.destroy();
+                dst_buffer.destroy();
+
                 // Split into per-polynomial vectors
                 let results: Vec<Vec<GoldilocksField>> = (0..num_polys)
                     .into_par_iter()
@@ -521,6 +525,10 @@ mod fft {
                 let all_data = plonky2::maybe_await!(
                     utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * n)
                 );
+
+                // Free GPU buffers immediately (critical for iOS Safari memory pressure)
+                src_buffer.destroy();
+                dst_buffer.destroy();
 
                 // Split into PolynomialCoeffs (no from_mont needed)
                 let results: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_polys)
@@ -820,6 +828,12 @@ macro_rules! impl_webgpu_prover_compute {
                         })
                         .collect();
 
+                    // Free all GPU buffers immediately (critical for iOS Safari memory pressure)
+                    input_buffer.destroy();
+                    ping_buffer.destroy();
+                    pong_buffer.destroy();
+                    tree_buffer.destroy();
+
                     Ok(MerkleTree {
                         leaves,
                         digests: tree_digests,
@@ -919,6 +933,13 @@ macro_rules! impl_webgpu_prover_compute {
                                 lde_size * num_cols,
                             )
                         );
+
+                        // Explicitly free GPU buffers now rather than waiting for GC.
+                        // Critical on memory-constrained devices (iOS Safari) to avoid
+                        // BufferAsyncError in the subsequent build_merkle_tree call.
+                        _src_buffer.destroy();
+                        dst_buffer.destroy();
+                        leaf_buffer.destroy();
 
                         // Split into rows, adding random salt columns if needed
                         if salt_size == 0 {

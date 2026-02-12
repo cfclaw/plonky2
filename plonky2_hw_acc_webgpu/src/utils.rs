@@ -138,15 +138,18 @@ pub fn download_field_data(
 
     drop(data);
     staging.unmap();
+    staging.destroy();
 
     result
 }
 
 /// Async version of download_field_data for WASM.
-/// Uses wgpu::util::DownloadBuffer which handles staging/copy/map internally,
-/// and a futures_channel oneshot to convert the callback into an awaitable future.
-/// On WASM, .await properly yields to the browser event loop so the GPU
-/// mapAsync completion can fire.
+/// Uses manual staging buffer with explicit destroy() to free GPU memory
+/// immediately after reading. This is critical on memory-constrained devices
+/// (e.g. iPhone Safari) where DownloadBuffer's deferred cleanup can cause
+/// BufferAsyncError from accumulated memory pressure.
+/// On WASM, .await yields to the browser event loop so the GPU mapAsync
+/// completion can fire.
 #[cfg(feature = "async_prover")]
 pub async fn download_field_data(
     device: &wgpu::Device,
@@ -158,35 +161,47 @@ pub async fn download_field_data(
 
     log_gpu(&format!("  [gpu] download: {} elems ({} bytes)", num_elements, size_bytes));
 
-    // Copy bytes out inside the callback so we only send Vec<u8> (which is
-    // Send) through the channel. DownloadBuffer itself is !Send on WASM
-    // because it contains JS types with raw pointers.
-    let (tx, rx) = futures_channel::oneshot::channel::<Vec<u8>>();
-    wgpu::util::DownloadBuffer::read_buffer(
-        device,
-        queue,
-        &src_buffer.slice(..size_bytes),
-        move |result| {
-            let download = result.unwrap();
-            let _ = tx.send(download.to_vec());
-        },
-    );
-    // On WASM, device.poll is a no-op — the browser drives the GPU.
-    // The .await on rx yields to the browser event loop, allowing the
-    // GPU mapAsync completion to fire and the callback to execute.
+    // Create staging buffer explicitly so we control its lifecycle.
+    let staging = create_staging_buffer_read(device, size_bytes, "download_staging");
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("download_encoder"),
+    });
+    encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size_bytes);
+    queue.submit(Some(encoder.finish()));
+
+    // Map the staging buffer for reading via oneshot channel.
+    let buffer_slice = staging.slice(..);
+    let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+
+    // On WASM this is a no-op; on native it drives completion.
     device.poll(wgpu::Maintain::Wait);
 
-    let bytes = rx.await.unwrap();
-    // Construct Vec directly from bytes without an intermediate slice copy.
+    // Await the mapping — yields to browser event loop on WASM.
+    rx.await
+        .expect("GPU download channel cancelled")
+        .expect("GPU buffer map failed (BufferAsyncError). Device may be lost due to memory pressure.");
+
+    // Read the mapped data.
+    let data = buffer_slice.get_mapped_range();
     let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
     unsafe {
         std::ptr::copy_nonoverlapping(
-            bytes.as_ptr() as *const GoldilocksField,
+            data.as_ptr() as *const GoldilocksField,
             result.as_mut_ptr(),
             num_elements,
         );
         result.set_len(num_elements);
     }
+
+    drop(data);
+    staging.unmap();
+    // Explicitly destroy the staging buffer to free GPU memory immediately,
+    // rather than waiting for JS GC. Prevents memory pressure on iOS Safari.
+    staging.destroy();
 
     log_gpu("  [gpu] download: complete");
 
