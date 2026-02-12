@@ -8,7 +8,7 @@ self.onmessage = async (e: MessageEvent) => {
       initPanic();
 
       self.postMessage({ type: 'status', status: 'Running CPU benchmark (this will take a while)...' });
-      const result = run_cpu_benchmark();
+      const result = await run_cpu_benchmark();
 
       self.postMessage({ type: 'result', result });
     } catch (err: any) {

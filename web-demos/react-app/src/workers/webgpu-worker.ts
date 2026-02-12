@@ -11,7 +11,7 @@ self.onmessage = async (e: MessageEvent) => {
       await init_gpu();
 
       self.postMessage({ type: 'status', status: 'Running WebGPU benchmark (this will take a while)...' });
-      const result = run_webgpu_benchmark();
+      const result = await run_webgpu_benchmark();
 
       self.postMessage({ type: 'result', result });
     } catch (err: any) {
