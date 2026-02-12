@@ -2,3 +2,5 @@ target/
 node_modules/
 dist/
 pkg/
+# WASM build output copied into react-app source tree by build.sh
+react-app/src/wasm/
