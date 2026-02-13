@@ -396,7 +396,7 @@ mod fft {
 
                 // Download results (already in standard form - no CPU from_mont needed)
                 let all_data = plonky2::maybe_await!(
-                    utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * lde_size)
+                    utils::download_field_data(ctx, &dst_buffer, num_polys * lde_size)
                 );
 
                 dst_buffer.destroy();
@@ -531,7 +531,7 @@ mod fft {
 
                 // Download results (already in standard form)
                 let all_data = plonky2::maybe_await!(
-                    utils::download_field_data(&ctx.device, &ctx.queue, &dst_buffer, num_polys * n)
+                    utils::download_field_data(ctx, &dst_buffer, num_polys * n)
                 );
 
                 dst_buffer.destroy();
@@ -812,8 +812,7 @@ macro_rules! impl_webgpu_prover_compute {
                     // Read back results
                     let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
                         let raw = plonky2::maybe_await!(utils::download_field_data(
-                            &ctx.device,
-                            &ctx.queue,
+                            ctx,
                             &tree_buffer,
                             num_digests * HASH_SIZE,
                         ));
@@ -827,8 +826,7 @@ macro_rules! impl_webgpu_prover_compute {
                     };
 
                     let cap_raw = plonky2::maybe_await!(utils::download_field_data(
-                        &ctx.device,
-                        &ctx.queue,
+                        ctx,
                         current_ping,
                         cap_len * HASH_SIZE,
                     ));
@@ -946,8 +944,7 @@ macro_rules! impl_webgpu_prover_compute {
                         // Download transposed leaf data
                         let all_leaf_data = plonky2::maybe_await!(
                             utils::download_field_data(
-                                &ctx.device,
-                                &ctx.queue,
+                                ctx,
                                 &leaf_buffer,
                                 lde_size * num_cols,
                             )
@@ -1223,7 +1220,7 @@ mod tests {
         fft::encode_mont_convert(ctx, &mut encoder, &buffer, n, 1, 1); // from_mont
         ctx.queue.submit(Some(encoder.finish()));
 
-        let result = utils::download_field_data(&ctx.device, &ctx.queue, &buffer, n);
+        let result = utils::download_field_data(ctx, &buffer, n);
         assert_eq!(data, result, "GPU Montgomery round-trip failed");
     }
 
@@ -1288,8 +1285,7 @@ mod tests {
         ctx.queue.submit(Some(encoder.finish()));
 
         let gpu_data = utils::download_field_data(
-            &ctx.device,
-            &ctx.queue,
+            ctx,
             &dst_buffer,
             lde_size * num_polys,
         );
