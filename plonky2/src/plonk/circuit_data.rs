@@ -231,6 +231,34 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         proof.decompress(&self.verifier_only.circuit_digest, &self.common)
     }
 
+    /// Save this circuit data to a file for later reuse.
+    ///
+    /// This serializes the full circuit data (prover + verifier + common)
+    /// to the given path using the plonky2 binary format. Load it back
+    /// with [`CircuitData::load_from_file`].
+    #[cfg(feature = "std")]
+    pub fn save_to_file(
+        &self,
+        path: &std::path::Path,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<()> {
+        let bytes = self.to_bytes(gate_serializer, generator_serializer)?;
+        std::fs::write(path, bytes).map_err(|_| crate::util::serialization::IoError)?;
+        Ok(())
+    }
+
+    /// Load circuit data from a file previously saved with [`CircuitData::save_to_file`].
+    #[cfg(feature = "std")]
+    pub fn load_from_file(
+        path: &std::path::Path,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<Self> {
+        let bytes = std::fs::read(path).map_err(|_| crate::util::serialization::IoError)?;
+        Self::from_bytes(&bytes, gate_serializer, generator_serializer)
+    }
+
     pub fn verifier_data(&self) -> VerifierCircuitData<F, C, D> {
         let CircuitData {
             verifier_only,
@@ -295,6 +323,31 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         buffer.read_prover_circuit_data(gate_serializer, generator_serializer)
     }
 
+    /// Save this prover circuit data to a file for later reuse.
+    #[cfg(feature = "std")]
+    pub fn save_to_file(
+        &self,
+        path: &std::path::Path,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<()> {
+        let bytes = self.to_bytes(gate_serializer, generator_serializer)?;
+        std::fs::write(path, bytes).map_err(|_| crate::util::serialization::IoError)?;
+        Ok(())
+    }
+
+    /// Load prover circuit data from a file previously saved with
+    /// [`ProverCircuitData::save_to_file`].
+    #[cfg(feature = "std")]
+    pub fn load_from_file(
+        path: &std::path::Path,
+        gate_serializer: &dyn GateSerializer<F, D>,
+        generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
+    ) -> IoResult<Self> {
+        let bytes = std::fs::read(path).map_err(|_| crate::util::serialization::IoError)?;
+        Self::from_bytes(&bytes, gate_serializer, generator_serializer)
+    }
+
     #[cfg(not(feature = "async_prover"))]
     pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {
         prove::<F, C, D>(
@@ -342,6 +395,29 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> IoResult<Self> {
         let mut buffer = Buffer::new(&bytes);
         buffer.read_verifier_circuit_data(gate_serializer)
+    }
+
+    /// Save this verifier circuit data to a file for later reuse.
+    #[cfg(feature = "std")]
+    pub fn save_to_file(
+        &self,
+        path: &std::path::Path,
+        gate_serializer: &dyn GateSerializer<F, D>,
+    ) -> IoResult<()> {
+        let bytes = self.to_bytes(gate_serializer)?;
+        std::fs::write(path, bytes).map_err(|_| crate::util::serialization::IoError)?;
+        Ok(())
+    }
+
+    /// Load verifier circuit data from a file previously saved with
+    /// [`VerifierCircuitData::save_to_file`].
+    #[cfg(feature = "std")]
+    pub fn load_from_file(
+        path: &std::path::Path,
+        gate_serializer: &dyn GateSerializer<F, D>,
+    ) -> IoResult<Self> {
+        let bytes = std::fs::read(path).map_err(|_| crate::util::serialization::IoError)?;
+        Self::from_bytes(bytes, gate_serializer)
     }
 
     pub fn verify(&self, proof_with_pis: ProofWithPublicInputs<F, C, D>) -> Result<()> {
