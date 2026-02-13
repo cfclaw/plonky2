@@ -13,6 +13,7 @@ const BIT_REVERSE_COPY_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/bit_
 const IFFT_REORDER_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/ifft_reorder.wgsl"));
 const MONT_CONVERT_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/mont_convert.wgsl"));
 const TRANSPOSE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/transpose.wgsl"));
+const SCATTER_SALT_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/scatter_salt.wgsl"));
 const MERKLE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/merkle.wgsl"));
 
 const MAX_DEGREE_LOG: usize = 18;
@@ -111,9 +112,10 @@ impl WebGpuContext {
         ctx.compile_pipeline("bit_reverse_copy_batched", BIT_REVERSE_COPY_WGSL)?;
         ctx.compile_pipeline("ifft_reorder_and_scale_batched", IFFT_REORDER_WGSL)?;
 
-        // Compile utility pipelines (Montgomery conversion, transpose)
+        // Compile utility pipelines (Montgomery conversion, transpose, salt scatter)
         ctx.compile_pipeline("mont_convert_batched", MONT_CONVERT_WGSL)?;
         ctx.compile_pipeline("transpose_and_bit_reverse", TRANSPOSE_WGSL)?;
+        ctx.compile_pipeline("scatter_salt", SCATTER_SALT_WGSL)?;
 
         // Compile Merkle pipelines
         ctx.compile_pipeline("copy_row_leaves", MERKLE_WGSL)?;

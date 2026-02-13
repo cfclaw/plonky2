@@ -37,15 +37,15 @@ mod fft {
     /// Params struct matching the WGSL FftParams layout (8 x u32 = 32 bytes)
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-    struct FftParams {
-        n: u32,
-        log_n: u32,
-        num_coeffs: u32,
-        layer: u32,
-        stride: u32,
-        n_inv_lo: u32,
-        n_inv_hi: u32,
-        twiddle_offset: u32,
+    pub(super) struct FftParams {
+        pub(super) n: u32,
+        pub(super) log_n: u32,
+        pub(super) num_coeffs: u32,
+        pub(super) layer: u32,
+        pub(super) stride: u32,
+        pub(super) n_inv_lo: u32,
+        pub(super) n_inv_hi: u32,
+        pub(super) twiddle_offset: u32,
     }
 
     /// Params for the Montgomery conversion shader
@@ -66,6 +66,16 @@ mod fft {
         num_polys: u32,
         num_cols: u32,
         log_lde_size: u32,
+    }
+
+    /// Params for the scatter_salt shader
+    #[repr(C)]
+    #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+    pub(super) struct ScatterSaltParams {
+        lde_size: u32,
+        num_polys: u32,
+        num_cols: u32,
+        salt_size: u32,
     }
 
     /// Encode a Montgomery conversion pass into the command encoder.
@@ -166,9 +176,152 @@ mod fft {
         drop(pass);
     }
 
+    /// Encode a scatter-salt pass into the command encoder.
+    /// Copies contiguous random salt values from `salt_buffer` into the salt columns
+    /// of `leaf_buffer` (columns [num_polys..num_polys+salt_size) in each row).
+    pub(super) fn encode_scatter_salt(
+        ctx: &WebGpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        leaf_buffer: &wgpu::Buffer,
+        salt_buffer: &wgpu::Buffer,
+        lde_size: usize,
+        num_polys: usize,
+        num_cols: usize,
+        salt_size: usize,
+    ) {
+        let pipeline = ctx.get_pipeline("scatter_salt").unwrap();
+
+        let params = ScatterSaltParams {
+            lde_size: lde_size as u32,
+            num_polys: num_polys as u32,
+            num_cols: num_cols as u32,
+            salt_size: salt_size as u32,
+        };
+        let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
+
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scatter_salt_bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: leaf_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: salt_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("scatter_salt_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, Some(&bind_group), &[]);
+        pass.dispatch_workgroups(utils::div_ceil(lde_size as u32, 256), 1, 1);
+        drop(pass);
+    }
+
+    /// Variant of `encode_coset_fft_batched` that uses an existing GPU buffer as source
+    /// instead of uploading from CPU. The buffer is converted to Montgomery form in-place.
+    /// Returns (dst_buffer, shifts_buffer). The caller must destroy these after submit.
+    pub(super) fn encode_coset_fft_from_buffer(
+        ctx: &WebGpuContext,
+        encoder: &mut wgpu::CommandEncoder,
+        src_buffer: &wgpu::Buffer,
+        num_coeffs: usize,
+        num_polys: usize,
+        log_lde_size: usize,
+        shift: GoldilocksField,
+    ) -> Result<(wgpu::Buffer, wgpu::Buffer)> {
+        let lde_size = 1 << log_lde_size;
+
+        // GPU: convert to Montgomery form in-place
+        encode_mont_convert(ctx, encoder, src_buffer, num_coeffs, num_polys, 0);
+
+        // Upload shift powers (small)
+        let powers_of_shift: Vec<u64> = shift
+            .powers()
+            .take(num_coeffs)
+            .map(|f| utils::to_mont(f.0))
+            .collect();
+        let shifts_buffer = utils::upload_u64_data(&ctx.device, &powers_of_shift, "fft_shifts");
+
+        let dst_size = (num_polys * lde_size * 8) as u64;
+        let dst_buffer = utils::create_storage_buffer(&ctx.device, dst_size, "fft_dst");
+
+        // Coset scale + bit reverse params
+        let params = FftParams {
+            n: lde_size as u32,
+            log_n: log_lde_size as u32,
+            num_coeffs: num_coeffs as u32,
+            layer: 0,
+            stride: lde_size as u32,
+            n_inv_lo: 0,
+            n_inv_hi: 0,
+            twiddle_offset: 0,
+        };
+        let params_buffer = super::create_uniform_buffer(&ctx.device, &params);
+
+        // Encode coset scale + bit reverse
+        {
+            let pipeline = ctx
+                .get_pipeline("coset_scale_and_bit_reverse_batched")
+                .unwrap();
+            let bind_group_layout = pipeline.get_bind_group_layout(0);
+            let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("coset_scale_bg"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: dst_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: src_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: shifts_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("coset_scale_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
+            let wg_x = utils::div_ceil(lde_size as u32, 256);
+            pass.dispatch_workgroups(wg_x, num_polys as u32, 1);
+            drop(pass);
+        }
+
+        // Encode FFT passes
+        let twiddles = ctx
+            .twiddle_buffers
+            .get(&log_lde_size)
+            .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", log_lde_size))?;
+        encode_fft_passes_batched(ctx, encoder, &dst_buffer, log_lde_size, lde_size, num_polys, twiddles);
+
+        Ok((dst_buffer, shifts_buffer))
+    }
+
     /// Upload raw GoldilocksField data from multiple slices into a contiguous GPU buffer.
     /// Returns the buffer with elements as raw u64 bytes (standard form, not Montgomery).
-    fn upload_raw_field_slices(
+    pub(super) fn upload_raw_field_slices(
         ctx: &WebGpuContext,
         slices: &[&[GoldilocksField]],
         elements_per_slice: usize,
@@ -202,7 +355,7 @@ mod fft {
     }
 
     /// Encode batched FFT DIT passes into the command encoder.
-    fn encode_fft_passes_batched(
+    pub(super) fn encode_fft_passes_batched(
         ctx: &WebGpuContext,
         encoder: &mut wgpu::CommandEncoder,
         buffer: &wgpu::Buffer,
@@ -363,6 +516,7 @@ mod fft {
         ($($async_kw:tt)*) => {
             /// Batch coset FFT: process all polynomials in a single GPU dispatch sequence.
             /// Uploads raw field elements and performs Montgomery conversion on GPU.
+            #[allow(dead_code)]
             pub $($async_kw)* fn run_gpu_coset_fft_batch(
                 ctx: &WebGpuContext,
                 all_coeffs: &[&[GoldilocksField]],
@@ -589,6 +743,351 @@ fn create_uniform_buffer<T: bytemuck::Pod>(device: &wgpu::Device, data: &T) -> w
 type F = GoldilocksField;
 type C = PoseidonGoldilocksWebGpuConfig;
 const D: usize = 2;
+
+/// Shared GPU-resident pipeline helpers.
+/// These avoid the GPU→CPU→GPU round trip for leaf data between FFT and Merkle tree building.
+macro_rules! impl_gpu_commit_helpers {
+    ($($async_kw:tt)*) => {
+        /// Build a Merkle tree from leaf data already in a GPU buffer.
+        /// The leaf_buffer must contain `num_leaves` rows of `leaf_size` elements each,
+        /// stored contiguously in row-major order.
+        /// Returns (tree_digests, cap_hashes). Does NOT destroy leaf_buffer.
+        $($async_kw)* fn build_merkle_tree_from_gpu_leaves(
+            ctx: &WebGpuContext,
+            leaf_buffer: &wgpu::Buffer,
+            num_leaves: usize,
+            leaf_size: usize,
+            cap_height: usize,
+        ) -> anyhow::Result<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+            const HASH_SIZE: usize = 4; // NUM_HASH_OUT_ELTS
+            let log2_leaves = log2_strict(num_leaves);
+
+            // Create ping/pong and tree buffers
+            let leaf_hash_bytes = (num_leaves * HASH_SIZE * 8) as u64;
+            let ping_buffer =
+                utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_ping");
+            let pong_buffer =
+                utils::create_storage_buffer(&ctx.device, leaf_hash_bytes, "merkle_pong");
+
+            let cap_len = 1usize << cap_height;
+            let num_digests = 2 * (num_leaves - cap_len);
+            let tree_bytes = (num_digests * HASH_SIZE * 8) as u64;
+            let tree_buffer = utils::create_storage_buffer(
+                &ctx.device,
+                tree_bytes.max(8),
+                "merkle_tree",
+            );
+
+            let mut encoder =
+                ctx.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("merkle_from_gpu_encoder"),
+                    });
+
+            // Dispatch leaf hashing
+            let use_copy = leaf_size <= HASH_SIZE;
+            let pipeline_name = if use_copy {
+                "copy_row_leaves"
+            } else {
+                "hash_row_leaves"
+            };
+            let leaf_pipeline = ctx.get_pipeline(pipeline_name).unwrap();
+
+            let leaf_params = MerkleParams {
+                num_leaves: num_leaves as u32,
+                leaf_size: leaf_size as u32,
+                layer_idx: 0,
+                pairs_per_subtree: 0,
+                subtree_digest_len: 0,
+                _pad1: 0,
+                _pad2: 0,
+                _pad3: 0,
+            };
+            let leaf_params_buf = create_uniform_buffer(&ctx.device, &leaf_params);
+
+            {
+                let bind_group_layout = leaf_pipeline.get_bind_group_layout(0);
+                let bind_group =
+                    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("leaf_hash_bg"),
+                        layout: &bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: leaf_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: ping_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: leaf_params_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                let mut pass =
+                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("leaf_hash_pass"),
+                        timestamp_writes: None,
+                    });
+                pass.set_pipeline(leaf_pipeline);
+                pass.set_bind_group(0, Some(&bind_group), &[]);
+                pass.dispatch_workgroups(
+                    utils::div_ceil(num_leaves as u32, 256),
+                    1,
+                    1,
+                );
+                drop(pass);
+            }
+
+            // Compress layers (ping-pong)
+            let subtree_height = log2_leaves - cap_height;
+            let subtree_digest_len = if subtree_height > 0 {
+                2 * ((1usize << subtree_height) - 1)
+            } else {
+                0
+            };
+
+            let compress_pipeline = ctx.get_pipeline("compress_nodes").unwrap();
+            let mut current_pairs = num_leaves / 2;
+            let mut current_ping = &ping_buffer;
+            let mut current_pong = &pong_buffer;
+
+            for layer in 0..subtree_height {
+                let nodes_per_subtree = 1usize << (subtree_height - layer);
+                let pairs_per_subtree = nodes_per_subtree / 2;
+
+                let layer_params = MerkleParams {
+                    num_leaves: current_pairs as u32,
+                    leaf_size: 0,
+                    layer_idx: layer as u32,
+                    pairs_per_subtree: pairs_per_subtree as u32,
+                    subtree_digest_len: subtree_digest_len as u32,
+                    _pad1: 0,
+                    _pad2: 0,
+                    _pad3: 0,
+                };
+                let layer_params_buf =
+                    create_uniform_buffer(&ctx.device, &layer_params);
+
+                let bind_group_layout = compress_pipeline.get_bind_group_layout(0);
+                let bind_group =
+                    ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("compress_bg"),
+                        layout: &bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: current_ping.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: current_pong.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: layer_params_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: tree_buffer.as_entire_binding(),
+                            },
+                        ],
+                    });
+
+                let mut pass =
+                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("compress_pass"),
+                        timestamp_writes: None,
+                    });
+                pass.set_pipeline(compress_pipeline);
+                pass.set_bind_group(0, Some(&bind_group), &[]);
+                pass.dispatch_workgroups(
+                    utils::div_ceil(current_pairs as u32, 256),
+                    1,
+                    1,
+                );
+                drop(pass);
+
+                std::mem::swap(&mut current_ping, &mut current_pong);
+                current_pairs /= 2;
+            }
+
+            ctx.queue.submit(Some(encoder.finish()));
+
+            // Download tree digests and cap (small amounts)
+            let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
+                let raw = plonky2::maybe_await!(utils::download_field_data(
+                    ctx,
+                    &tree_buffer,
+                    num_digests * HASH_SIZE,
+                ));
+                raw.chunks(HASH_SIZE)
+                    .map(|c| HashOut {
+                        elements: [c[0], c[1], c[2], c[3]],
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            let cap_raw = plonky2::maybe_await!(utils::download_field_data(
+                ctx,
+                current_ping,
+                cap_len * HASH_SIZE,
+            ));
+            let cap_hashes: Vec<HashOut<F>> = cap_raw
+                .chunks(HASH_SIZE)
+                .map(|c| HashOut {
+                    elements: [c[0], c[1], c[2], c[3]],
+                })
+                .collect();
+
+            // Free Merkle GPU buffers
+            ping_buffer.destroy();
+            pong_buffer.destroy();
+            tree_buffer.destroy();
+
+            Ok((tree_digests, cap_hashes))
+        }
+
+        /// Fused pipeline: takes an FFT result buffer in Montgomery form, applies from_mont,
+        /// transposes, scatters salt if needed, builds Merkle tree, and downloads leaves.
+        /// Destroys fft_dst_buffer. Returns (MerkleTree, downloaded leaves).
+        $($async_kw)* fn finalize_commitment(
+            ctx: &WebGpuContext,
+            timing: &mut TimingTree,
+            fft_dst_buffer: wgpu::Buffer,
+            lde_size: usize,
+            lde_degree_log: usize,
+            num_polys: usize,
+            blinding: bool,
+            cap_height: usize,
+        ) -> anyhow::Result<MerkleTree<F, PoseidonHash>> {
+            const SALT_SIZE: usize = 4;
+            let salt_size = if blinding { SALT_SIZE } else { 0 };
+            let num_cols = num_polys + salt_size;
+
+            // Phase 1: from_mont + Transpose
+            let leaf_buffer_size = (lde_size * num_cols * 8) as u64;
+            let leaf_buffer = utils::create_storage_buffer(
+                &ctx.device,
+                leaf_buffer_size,
+                "transposed_leaves",
+            );
+
+            {
+                let mut encoder = ctx.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("from_mont_transpose_encoder"),
+                    },
+                );
+
+                // from_mont on FFT result
+                fft::encode_mont_convert(ctx, &mut encoder, &fft_dst_buffer, lde_size, num_polys, 1);
+
+                // Transpose + bit_reverse
+                fft::encode_transpose_and_bit_reverse(
+                    ctx,
+                    &mut encoder,
+                    &fft_dst_buffer,
+                    &leaf_buffer,
+                    lde_size,
+                    num_polys,
+                    num_cols,
+                    lde_degree_log,
+                );
+
+                ctx.queue.submit(Some(encoder.finish()));
+            }
+
+            // fft_dst no longer needed — free memory before Merkle phase
+            fft_dst_buffer.destroy();
+
+            // Phase 2: Scatter salt (if blinding enabled)
+            if salt_size > 0 {
+                let salt_values: Vec<F> = (0..lde_size * SALT_SIZE)
+                    .map(|_| F::rand())
+                    .collect();
+
+                // Upload contiguous salt data
+                let salt_bytes = (salt_values.len() * 8) as u64;
+                let salt_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("salt_data"),
+                    size: salt_bytes,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: true,
+                });
+                {
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            salt_values.as_ptr() as *const u8,
+                            salt_values.len() * 8,
+                        )
+                    };
+                    salt_buffer.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
+                }
+                salt_buffer.unmap();
+
+                let mut encoder = ctx.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("scatter_salt_encoder"),
+                    },
+                );
+                fft::encode_scatter_salt(
+                    ctx, &mut encoder, &leaf_buffer, &salt_buffer,
+                    lde_size, num_polys, num_cols, SALT_SIZE,
+                );
+                ctx.queue.submit(Some(encoder.finish()));
+                salt_buffer.destroy();
+            }
+
+            // Phase 3: Build Merkle tree directly from GPU leaf buffer
+            let (tree_digests, cap_hashes) = timed!(
+                timing,
+                "build Merkle tree (WebGPU, GPU-resident)",
+                plonky2::maybe_await!(build_merkle_tree_from_gpu_leaves(
+                    ctx,
+                    &leaf_buffer,
+                    lde_size,
+                    num_cols,
+                    cap_height,
+                ))?
+            );
+
+            // Phase 4: Download leaves (Merkle GPU buffers already freed, lower memory pressure)
+            let all_leaf_data = plonky2::maybe_await!(
+                utils::download_field_data(ctx, &leaf_buffer, lde_size * num_cols)
+            );
+            leaf_buffer.destroy();
+
+            // Split into per-row leaves
+            let leaves: Vec<Vec<F>> = (0..lde_size)
+                .into_par_iter()
+                .map(|row| {
+                    let start = row * num_cols;
+                    all_leaf_data[start..start + num_cols].to_vec()
+                })
+                .collect();
+
+            Ok(MerkleTree {
+                leaves,
+                digests: tree_digests,
+                cap: MerkleCap(cap_hashes),
+            })
+        }
+    };
+}
+
+#[cfg(not(feature = "async_prover"))]
+impl_gpu_commit_helpers!();
+
+#[cfg(feature = "async_prover")]
+impl_gpu_commit_helpers!(async);
 
 macro_rules! impl_webgpu_prover_compute {
     ($($async_kw:tt)*) => {
@@ -876,15 +1375,14 @@ macro_rules! impl_webgpu_prover_compute {
                     );
                 }
 
-                const SALT_SIZE: usize = 4;
-                let salt_size = if blinding { SALT_SIZE } else { 0 };
                 let num_polys = polynomials.len();
                 let lde_size = 1 << lde_degree_log;
-                let num_cols = num_polys + salt_size;
 
-                let leaves: Vec<Vec<F>> = timed!(
+                // GPU-resident pipeline: FFT → transpose → salt → Merkle → download
+                // No intermediate GPU→CPU→GPU round trip for leaf data.
+                let merkle_tree = timed!(
                     timing,
-                    "FFT + transpose (WebGPU fused)",
+                    "FFT + transpose + Merkle (WebGPU fused)",
                     {
                         let ctx_guard = crate::context::acquire_context()?;
                         let ctx = &*ctx_guard;
@@ -892,95 +1390,44 @@ macro_rules! impl_webgpu_prover_compute {
                         let coeff_slices: Vec<&[F]> =
                             polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
 
-                        let mut encoder = ctx.device.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("fused_fft_transpose_encoder"),
-                            },
-                        );
+                        // Phase 1: Upload + Coset FFT on GPU
+                        let fft_dst_buffer = {
+                            let mut encoder = ctx.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor {
+                                    label: Some("coset_fft_encoder"),
+                                },
+                            );
 
-                        // GPU: upload + to_mont + coset_scale + FFT (results in Montgomery on dst_buffer)
-                        let (src_buffer, dst_buffer, shifts_buffer) = fft::encode_coset_fft_batched(
-                            ctx,
-                            &mut encoder,
-                            &coeff_slices,
-                            lde_degree_log,
-                            F::coset_shift(),
-                        )?;
-
-                        // GPU: convert from Montgomery form
-                        fft::encode_mont_convert(ctx, &mut encoder, &dst_buffer, lde_size, num_polys, 1);
-
-                        // GPU: transpose + bit_reverse (poly-major → evaluation-major with bit-reversed rows)
-                        // Output buffer has num_cols columns per row (leaves room for salt columns)
-                        let leaf_buffer_size = (lde_size * num_cols * 8) as u64;
-                        let leaf_buffer = utils::create_storage_buffer(
-                            &ctx.device,
-                            leaf_buffer_size,
-                            "transposed_leaves",
-                        );
-                        fft::encode_transpose_and_bit_reverse(
-                            ctx,
-                            &mut encoder,
-                            &dst_buffer,
-                            &leaf_buffer,
-                            lde_size,
-                            num_polys,
-                            num_cols,
-                            lde_degree_log,
-                        );
-
-                        // Submit all GPU work at once (to_mont + coset_scale + FFT + from_mont + transpose)
-                        ctx.queue.submit(Some(encoder.finish()));
-
-                        // Free GPU buffers that are no longer needed BEFORE the download.
-                        // The GPU commands are already submitted; the driver keeps internal
-                        // references to buffer memory until those commands complete.
-                        // Destroying early reduces peak memory by ~160MB, preventing
-                        // device loss from OOM on memory-constrained GPUs.
-                        src_buffer.destroy();
-                        dst_buffer.destroy();
-                        shifts_buffer.destroy();
-
-                        // Download transposed leaf data
-                        let all_leaf_data = plonky2::maybe_await!(
-                            utils::download_field_data(
+                            let (src_buffer, dst_buffer, shifts_buffer) = fft::encode_coset_fft_batched(
                                 ctx,
-                                &leaf_buffer,
-                                lde_size * num_cols,
-                            )
-                        );
+                                &mut encoder,
+                                &coeff_slices,
+                                lde_degree_log,
+                                F::coset_shift(),
+                            )?;
 
-                        leaf_buffer.destroy();
+                            ctx.queue.submit(Some(encoder.finish()));
 
-                        // Split into rows, adding random salt columns if needed
-                        if salt_size == 0 {
-                            (0..lde_size)
-                                .into_par_iter()
-                                .map(|row| {
-                                    let start = row * num_cols;
-                                    all_leaf_data[start..start + num_cols].to_vec()
-                                })
-                                .collect()
-                        } else {
-                            (0..lde_size)
-                                .into_par_iter()
-                                .map(|row| {
-                                    let start = row * num_cols;
-                                    let mut row_data = Vec::with_capacity(num_cols);
-                                    row_data.extend_from_slice(&all_leaf_data[start..start + num_polys]);
-                                    for _ in 0..salt_size {
-                                        row_data.push(F::rand());
-                                    }
-                                    row_data
-                                })
-                                .collect()
-                        }
+                            // Free input buffers — reduces peak memory before transpose phase
+                            src_buffer.destroy();
+                            shifts_buffer.destroy();
+
+                            dst_buffer
+                        };
+
+                        // Phase 2-4: from_mont + transpose + salt + Merkle + download leaves
+                        plonky2::maybe_await!(finalize_commitment(
+                            ctx,
+                            timing,
+                            fft_dst_buffer,
+                            lde_size,
+                            lde_degree_log,
+                            num_polys,
+                            blinding,
+                            cap_height,
+                        ))?
                     }
                 );
-
-                let merkle_tree = plonky2::maybe_await!(
-                    <Self as ProverCompute<F, C, D>>::build_merkle_tree(timing, leaves, cap_height)
-                )?;
 
                 Ok(PolynomialBatch {
                     polynomials,
@@ -999,9 +1446,11 @@ macro_rules! impl_webgpu_prover_compute {
                 cap_height: usize,
                 fft_root_table: Option<&FftRootTable<F>>,
             ) -> anyhow::Result<PolynomialBatch<F, C, D>> {
-                let degree_log = log2_strict(values[0].len());
+                let n = values[0].len();
+                let degree_log = log2_strict(n);
+                let lde_degree_log = degree_log + rate_bits;
 
-                if degree_log < 12 || degree_log + rate_bits > 22 {
+                if degree_log < 12 || lde_degree_log > 22 {
                     return plonky2::maybe_await!(
                         <CpuProverCompute as ProverCompute<F, C, D>>::compute_from_values(
                             timing, values, rate_bits, blinding, cap_height, fft_root_table,
@@ -1009,9 +1458,14 @@ macro_rules! impl_webgpu_prover_compute {
                     );
                 }
 
-                let coeffs = timed!(
+                let num_polys = values.len();
+                let lde_size = 1 << lde_degree_log;
+
+                // GPU-resident pipeline: IFFT → coset FFT → transpose → Merkle
+                // Eliminates IFFT download/re-upload round trip.
+                let (polynomials, merkle_tree) = timed!(
                     timing,
-                    "IFFT (WebGPU)",
+                    "IFFT + FFT + transpose + Merkle (WebGPU fused)",
                     {
                         let ctx_guard = crate::context::acquire_context()?;
                         let ctx = &*ctx_guard;
@@ -1019,13 +1473,171 @@ macro_rules! impl_webgpu_prover_compute {
                         let value_slices: Vec<&[GoldilocksField]> =
                             values.iter().map(|v| v.values.as_slice()).collect();
 
-                        plonky2::maybe_await!(fft::run_gpu_ifft_batch(ctx, &value_slices))?
-                    }
-                );
+                        // Phase 1: GPU IFFT — keep result on GPU
+                        let ifft_dst = {
+                            let ifft_src = fft::upload_raw_field_slices(ctx, &value_slices, n);
+                            let dst_size = (num_polys * n * 8) as u64;
+                            let ifft_dst = utils::create_storage_buffer(&ctx.device, dst_size, "ifft_dst");
 
-                plonky2::maybe_await!(Self::compute_from_coeffs(
-                    timing, coeffs, cap_height, rate_bits, blinding, fft_root_table
-                ))
+                            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("ifft_encoder"),
+                            });
+
+                            // GPU: to_mont
+                            fft::encode_mont_convert(ctx, &mut encoder, &ifft_src, n, num_polys, 0);
+
+                            // Bit-reverse copy
+                            {
+                                let params = fft::FftParams {
+                                    n: n as u32,
+                                    log_n: degree_log as u32,
+                                    num_coeffs: 0,
+                                    layer: 0,
+                                    stride: n as u32,
+                                    n_inv_lo: 0,
+                                    n_inv_hi: 0,
+                                    twiddle_offset: 0,
+                                };
+                                let params_buffer = create_uniform_buffer(&ctx.device, &params);
+
+                                let pipeline = ctx.get_pipeline("bit_reverse_copy_batched").unwrap();
+                                let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("br_bg"),
+                                    layout: &pipeline.get_bind_group_layout(0),
+                                    entries: &[
+                                        wgpu::BindGroupEntry { binding: 0, resource: ifft_dst.as_entire_binding() },
+                                        wgpu::BindGroupEntry { binding: 1, resource: ifft_src.as_entire_binding() },
+                                        wgpu::BindGroupEntry { binding: 2, resource: params_buffer.as_entire_binding() },
+                                    ],
+                                });
+
+                                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("bit_reverse_pass"),
+                                    timestamp_writes: None,
+                                });
+                                pass.set_pipeline(pipeline);
+                                pass.set_bind_group(0, Some(&bind_group), &[]);
+                                pass.dispatch_workgroups(utils::div_ceil(n as u32, 256), num_polys as u32, 1);
+                                drop(pass);
+                            }
+
+                            // FFT passes
+                            let twiddles = ctx.twiddle_buffers.get(&degree_log)
+                                .ok_or_else(|| anyhow::anyhow!("No twiddle buffer for log_n={}", degree_log))?;
+                            fft::encode_fft_passes_batched(ctx, &mut encoder, &ifft_dst, degree_log, n, num_polys, twiddles);
+
+                            // IFFT reorder and scale
+                            {
+                                let n_inv = GoldilocksField::inverse_2exp(degree_log);
+                                let n_inv_mont = utils::to_mont(n_inv.0);
+
+                                let params = fft::FftParams {
+                                    n: n as u32,
+                                    log_n: degree_log as u32,
+                                    num_coeffs: 0,
+                                    layer: 0,
+                                    stride: n as u32,
+                                    n_inv_lo: n_inv_mont as u32,
+                                    n_inv_hi: (n_inv_mont >> 32) as u32,
+                                    twiddle_offset: 0,
+                                };
+                                let params_buffer = create_uniform_buffer(&ctx.device, &params);
+
+                                let pipeline = ctx.get_pipeline("ifft_reorder_and_scale_batched").unwrap();
+                                let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("ifft_reorder_bg"),
+                                    layout: &pipeline.get_bind_group_layout(0),
+                                    entries: &[
+                                        wgpu::BindGroupEntry { binding: 0, resource: ifft_dst.as_entire_binding() },
+                                        wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
+                                    ],
+                                });
+
+                                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                    label: Some("ifft_reorder_pass"),
+                                    timestamp_writes: None,
+                                });
+                                pass.set_pipeline(pipeline);
+                                pass.set_bind_group(0, Some(&bind_group), &[]);
+                                pass.dispatch_workgroups(utils::div_ceil((n / 2) as u32, 256), num_polys as u32, 1);
+                                drop(pass);
+                            }
+
+                            // from_mont: convert IFFT result to standard form
+                            fft::encode_mont_convert(ctx, &mut encoder, &ifft_dst, n, num_polys, 1);
+
+                            ctx.queue.submit(Some(encoder.finish()));
+                            ifft_src.destroy();
+
+                            ifft_dst
+                        };
+
+                        // Phase 2: Download IFFT coefficients (while ifft_dst is in standard form)
+                        let coeffs_data = plonky2::maybe_await!(
+                            utils::download_field_data(ctx, &ifft_dst, num_polys * n)
+                        );
+
+                        // Phase 3: Coset FFT from GPU-resident IFFT buffer
+                        // encode_coset_fft_from_buffer applies to_mont in-place, which is fine
+                        // because we already downloaded the standard-form coefficients above.
+                        let fft_dst_buffer = {
+                            let mut encoder = ctx.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor {
+                                    label: Some("coset_fft_from_ifft_encoder"),
+                                },
+                            );
+
+                            let (fft_dst, shifts_buffer) = fft::encode_coset_fft_from_buffer(
+                                ctx,
+                                &mut encoder,
+                                &ifft_dst,
+                                n,
+                                num_polys,
+                                lde_degree_log,
+                                F::coset_shift(),
+                            )?;
+
+                            ctx.queue.submit(Some(encoder.finish()));
+
+                            // Free IFFT buffer and shifts — no longer needed
+                            ifft_dst.destroy();
+                            shifts_buffer.destroy();
+
+                            fft_dst
+                        };
+
+                        // Phase 4-6: from_mont + transpose + salt + Merkle + download leaves
+                        let merkle_tree = plonky2::maybe_await!(finalize_commitment(
+                            ctx,
+                            timing,
+                            fft_dst_buffer,
+                            lde_size,
+                            lde_degree_log,
+                            num_polys,
+                            blinding,
+                            cap_height,
+                        ))?;
+
+                        // Reconstruct polynomials from downloaded coefficients
+                        let polynomials: Vec<PolynomialCoeffs<F>> = (0..num_polys)
+                            .into_par_iter()
+                            .map(|i| {
+                                let offset = i * n;
+                                PolynomialCoeffs::new(coeffs_data[offset..offset + n].to_vec())
+                            })
+                            .collect();
+
+                        Ok::<_, anyhow::Error>((polynomials, merkle_tree))
+                    }
+                )?;
+
+                Ok(PolynomialBatch {
+                    polynomials,
+                    merkle_tree,
+                    degree_log,
+                    rate_bits,
+                    blinding,
+                })
             }
 
             $($async_kw)* fn transpose_and_compute_from_coeffs(
