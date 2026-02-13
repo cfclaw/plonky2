@@ -431,6 +431,31 @@ async fn gpu_sleep_ms(ms: u32) {
     }
 }
 
+/// Yield to the browser event loop so the GPU process can reclaim memory
+/// from recently destroyed buffers.
+///
+/// On iOS Safari, `buffer.destroy()` sends an IPC message to the GPU
+/// process, but the GPU process may not process it immediately —
+/// especially while busy with submitted GPU work. Yielding the worker
+/// thread gives the GPU process time to run its message loop and free
+/// memory before new allocations begin.
+///
+/// Call this between major pipeline phases (e.g. after FFT buffer
+/// destruction, before Merkle tree allocation) to prevent cumulative
+/// GPU memory exhaustion.
+///
+/// On the sync path (native), this is a no-op since `device.poll(Wait)`
+/// already synchronously drives GPU work to completion.
+#[cfg(feature = "async_prover")]
+pub async fn yield_for_gpu_gc() {
+    gpu_sleep_ms(50).await;
+}
+
+#[cfg(not(feature = "async_prover"))]
+pub fn yield_for_gpu_gc() {
+    // No-op: native uses device.poll(Wait) which is synchronous.
+}
+
 /// Convert a GoldilocksField element to Montgomery form.
 /// a_mont = a * R mod p, where R = 2^64, p = 2^64 - 2^32 + 1.
 /// R mod p = 2^32 - 1, so a_mont = a * (2^32 - 1) mod p.

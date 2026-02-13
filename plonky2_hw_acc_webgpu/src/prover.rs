@@ -804,10 +804,15 @@ macro_rules! impl_webgpu_prover_compute {
 
                     ctx.queue.submit(Some(encoder.finish()));
 
-                    // Free input_buffer immediately — it's the largest buffer and is no
-                    // longer referenced by any pending download commands. The submitted
-                    // hash/compress commands keep their own internal reference.
+                    // Free buffers that are no longer needed before downloads.
+                    // input_buffer is the largest (~67 MiB); current_pong is unused
+                    // after the compress loop (only current_ping has the cap hashes).
                     input_buffer.destroy();
+                    current_pong.destroy();
+
+                    // Yield to let the GPU process reclaim the destroyed buffers'
+                    // memory before we allocate staging buffers for downloads.
+                    plonky2::maybe_await!(utils::yield_for_gpu_gc());
 
                     // Read back results
                     let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
@@ -837,7 +842,9 @@ macro_rules! impl_webgpu_prover_compute {
                         })
                         .collect();
 
-                    // Free remaining GPU buffers
+                    // Free remaining GPU buffers.
+                    // Note: one of ping/pong was already destroyed above via
+                    // current_pong. destroy() is idempotent per the WebGPU spec.
                     ping_buffer.destroy();
                     pong_buffer.destroy();
                     tree_buffer.destroy();
@@ -951,6 +958,13 @@ macro_rules! impl_webgpu_prover_compute {
                         );
 
                         leaf_buffer.destroy();
+
+                        // Yield to let the GPU process reclaim memory from the
+                        // destroyed FFT buffers (src, dst, shifts, leaf). On iOS
+                        // Safari this is critical: without it, the ~200+ MiB of
+                        // pending destructions aren't processed before the merkle
+                        // tree phase allocates new buffers, causing OOM.
+                        plonky2::maybe_await!(utils::yield_for_gpu_gc());
 
                         // Split into rows, adding random salt columns if needed
                         if salt_size == 0 {
