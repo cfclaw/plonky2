@@ -375,7 +375,12 @@ async fn map_staging_with_retry(
             Ok(Ok(())) => return,
             Ok(Err(e)) if attempt < MAP_ASYNC_MAX_RETRIES => {
                 log_gpu(&format!("  [gpu] mapAsync failed: {:?}", e));
-                // Buffer returns to unmapped state after failure; safe to retry.
+                // The failed mapAsync leaves the buffer in a mapped/pending
+                // state internally. We must call unmap() to reset it to the
+                // unmapped state before we can call map_async again.
+                // Without this, the next map_async panics with
+                // "Buffer is already mapped".
+                staging.unmap();
             }
             Ok(Err(e)) => {
                 panic!(
