@@ -247,23 +247,13 @@ pub async fn download_field_data(
 
     log_gpu(&format!("  [gpu] download: {} elems ({} bytes)", num_elements, size_bytes));
 
-    // Create staging buffer explicitly so we control its lifecycle.
-    let staging = create_staging_buffer_read(device, size_bytes, "download_staging");
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("download_encoder"),
-    });
-    encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size_bytes);
-    queue.submit(Some(encoder.finish()));
-
-    // Map the staging buffer for reading, with retry on transient OOM.
-    // On iOS Safari, mapAsync can fail with BufferAsyncError when the GPU
-    // process is under memory pressure. Retrying after a brief delay gives
-    // the driver time to reclaim memory from recently destroyed buffers.
-    map_staging_with_retry(device, &staging, size_bytes).await;
+    // Copy source → staging and map, with retry (destroy + recreate) on OOM.
+    let staging = copy_and_map_with_retry(
+        device, queue, src_buffer, 0, size_bytes, "download_staging",
+    ).await;
 
     // Read the mapped data.
-    let data = staging.slice(..).get_mapped_range();
+    let data = staging.slice(..size_bytes).get_mapped_range();
     let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -298,7 +288,6 @@ async fn download_field_data_chunked_async(
     chunk_bytes: u64,
 ) -> Vec<GoldilocksField> {
     let chunk_elems = (chunk_bytes as usize) / std::mem::size_of::<GoldilocksField>();
-    let staging = create_staging_buffer_read(device, chunk_bytes, "download_staging_chunked");
     let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
 
     let mut offset = 0usize;
@@ -307,13 +296,10 @@ async fn download_field_data_chunked_async(
         let byte_count = (count * std::mem::size_of::<GoldilocksField>()) as u64;
         let byte_offset = (offset * std::mem::size_of::<GoldilocksField>()) as u64;
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("download_chunk_encoder"),
-        });
-        encoder.copy_buffer_to_buffer(src_buffer, byte_offset, &staging, 0, byte_count);
-        queue.submit(Some(encoder.finish()));
-
-        map_staging_with_retry(device, &staging, byte_count).await;
+        // Copy chunk → staging and map, with retry (destroy + recreate) on OOM.
+        let staging = copy_and_map_with_retry(
+            device, queue, src_buffer, byte_offset, byte_count, "download_chunk_staging",
+        ).await;
 
         let data = staging.slice(..byte_count).get_mapped_range();
         unsafe {
@@ -324,11 +310,11 @@ async fn download_field_data_chunked_async(
         }
         drop(data);
         staging.unmap();
+        staging.destroy();
 
         offset += count;
     }
 
-    staging.destroy();
     result
 }
 
@@ -340,28 +326,50 @@ const MAP_ASYNC_MAX_RETRIES: u32 = 3;
 #[cfg(feature = "async_prover")]
 const MAP_ASYNC_RETRY_BASE_MS: u32 = 100;
 
-/// Map a staging buffer for reading, retrying on transient `BufferAsyncError`.
+/// Copy `byte_count` bytes from `src_buffer` at `src_offset` into a freshly
+/// created staging buffer, map it, and return the mapped staging buffer.
 ///
-/// On iOS Safari, `mapAsync` can fail when the GPU process is under memory
-/// pressure. A brief delay between retries allows Safari's GPU process to
-/// reclaim memory from recently destroyed buffers. Each `.await` also yields
-/// to the browser event loop, which helps process pending GPU work.
+/// On iOS Safari, `mapAsync` can fail with `BufferAsyncError` when the GPU
+/// process is under memory pressure.  Simply re-mapping the *same* staging
+/// buffer does not free any GPU memory, so retries on the same buffer are
+/// ineffective.  Instead, on failure we **destroy** the staging buffer
+/// (releasing its GPU + IPC shared-memory allocation), wait for the GPU
+/// process to reclaim memory, then create a **fresh** staging buffer and
+/// re-submit the copy.  This gives the driver the best chance of finding
+/// free memory on the next attempt.
+///
+/// Returns the staging buffer in the mapped state.  The caller must read
+/// from it, call `unmap()`, then `destroy()`.
 #[cfg(feature = "async_prover")]
-async fn map_staging_with_retry(
+async fn copy_and_map_with_retry(
     device: &wgpu::Device,
-    staging: &wgpu::Buffer,
+    queue: &wgpu::Queue,
+    src_buffer: &wgpu::Buffer,
+    src_offset: u64,
     byte_count: u64,
-) {
+    label: &str,
+) -> wgpu::Buffer {
     for attempt in 0..=MAP_ASYNC_MAX_RETRIES {
         if attempt > 0 {
             let delay = MAP_ASYNC_RETRY_BASE_MS << (attempt - 1);
             log_gpu(&format!(
-                "  [gpu] mapAsync retry {}/{} after {}ms",
+                "  [gpu] mapAsync retry {}/{} after {}ms (destroying + recreating staging buffer)",
                 attempt, MAP_ASYNC_MAX_RETRIES, delay,
             ));
             gpu_sleep_ms(delay).await;
         }
 
+        // Create a fresh staging buffer for this attempt.
+        let staging = create_staging_buffer_read(device, byte_count, label);
+
+        // Copy from the source buffer into the staging buffer.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("download_retry_encoder"),
+        });
+        encoder.copy_buffer_to_buffer(src_buffer, src_offset, &staging, 0, byte_count);
+        queue.submit(Some(encoder.finish()));
+
+        // Try to map.
         let slice = staging.slice(..byte_count);
         let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -372,17 +380,17 @@ async fn map_staging_with_retry(
         device.poll(wgpu::Maintain::Wait);
 
         match rx.await {
-            Ok(Ok(())) => return,
+            Ok(Ok(())) => return staging,
             Ok(Err(e)) if attempt < MAP_ASYNC_MAX_RETRIES => {
                 log_gpu(&format!("  [gpu] mapAsync failed: {:?}", e));
-                // The failed mapAsync leaves the buffer in a mapped/pending
-                // state internally. We must call unmap() to reset it to the
-                // unmapped state before we can call map_async again.
-                // Without this, the next map_async panics with
-                // "Buffer is already mapped".
+                // Unmap (reset internal state) then destroy to release the
+                // staging buffer's GPU memory + IPC shared-memory allocation.
                 staging.unmap();
+                staging.destroy();
             }
             Ok(Err(e)) => {
+                staging.unmap();
+                staging.destroy();
                 panic!(
                     "GPU buffer map failed after {} retries (BufferAsyncError: {:?}). \
                      Device may be lost due to memory pressure.",
@@ -392,6 +400,7 @@ async fn map_staging_with_retry(
             Err(_) => panic!("GPU download channel cancelled"),
         }
     }
+    unreachable!()
 }
 
 /// Async sleep that works in both browser main thread and Web Worker contexts.
