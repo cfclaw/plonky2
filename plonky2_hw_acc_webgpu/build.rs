@@ -171,6 +171,8 @@ fn generate_fft_shaders(out_dir: &str) {
         ("ifft_reorder", include_str!("src/shaders/ifft_reorder.wgsl")),
         ("mont_convert", include_str!("src/shaders/mont_convert.wgsl")),
         ("transpose", include_str!("src/shaders/transpose.wgsl")),
+        ("fill_salt", include_str!("src/shaders/fill_salt.wgsl")),
+        ("coset_shift_inv", include_str!("src/shaders/coset_shift_inv.wgsl")),
     ];
 
     for (name, kernel_src) in kernels {
