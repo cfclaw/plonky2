@@ -18,12 +18,27 @@ const MERKLE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/merkle.wgsl"))
 const MAX_DEGREE_LOG: usize = 18;
 const MAX_RATE_BITS: usize = 4;
 
+/// Default download chunk size for mobile/memory-constrained GPUs: 16 MiB.
+pub const MOBILE_DOWNLOAD_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+
 pub struct WebGpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub pipelines: HashMap<String, wgpu::ComputePipeline>,
     /// Pre-computed twiddle factors in Montgomery form, keyed by log_n.
     pub twiddle_buffers: HashMap<usize, wgpu::Buffer>,
+    /// Maximum bytes per GPU→CPU download chunk. When non-zero, large buffer
+    /// downloads are split into multiple map/read cycles using a single staging
+    /// buffer of this size, reducing peak GPU memory allocation. This prevents
+    /// `BufferAsyncError` / device loss from OOM on mobile GPUs.
+    /// Set to 0 for unlimited (single-shot download, the default).
+    /// Recommended: [`MOBILE_DOWNLOAD_CHUNK_SIZE`] (16 MiB) for mobile.
+    pub download_chunk_size: u64,
+    /// The adapter's reported max_buffer_size, captured during initialization.
+    /// Useful for diagnostics and auto-configuration. On constrained devices
+    /// (e.g. iOS Safari reporting 256 MiB), chunked downloads are enabled
+    /// automatically.
+    pub max_buffer_size: u64,
 }
 
 impl WebGpuContext {
@@ -49,14 +64,22 @@ impl WebGpuContext {
         .await
         .ok_or_else(|| anyhow!("No suitable GPU adapter found"))?;
 
+        // Query adapter limits and clamp our requests to what the hardware
+        // actually supports. This prevents device creation failures on
+        // constrained GPUs (e.g. iOS Safari with max_buffer_size = 256 MiB).
+        let adapter_limits = adapter.limits();
+        let requested_max_buffer = (1u64 << 30).min(adapter_limits.max_buffer_size);
+        let requested_max_storage = (1u32 << 30).min(adapter_limits.max_storage_buffer_binding_size);
+        let requested_max_workgroups = 65535u32.min(adapter_limits.max_compute_workgroups_per_dimension);
+
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("plonky2_webgpu"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 1 << 30, // 1 GB
-                    max_buffer_size: 1 << 30,
-                    max_compute_workgroups_per_dimension: 65535,
+                    max_storage_buffer_binding_size: requested_max_storage,
+                    max_buffer_size: requested_max_buffer,
+                    max_compute_workgroups_per_dimension: requested_max_workgroups,
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -66,11 +89,20 @@ impl WebGpuContext {
         .await
         .map_err(|e| anyhow!("Failed to create WebGPU device: {}", e))?;
 
+        // Auto-configure chunked downloads for constrained devices.
+        // The WebGPU spec baseline maxBufferSize is 256 MiB, chosen to
+        // accommodate the lowest iOS tier (gpuweb Issue #1371). If the adapter
+        // reports ≤256 MiB, we're likely on a memory-constrained mobile device.
+        let is_constrained = adapter_limits.max_buffer_size <= 256 * 1024 * 1024;
+        let download_chunk_size = if is_constrained { MOBILE_DOWNLOAD_CHUNK_SIZE } else { 0 };
+
         let mut ctx = Self {
             device,
             queue,
             pipelines: HashMap::new(),
             twiddle_buffers: HashMap::new(),
+            download_chunk_size,
+            max_buffer_size: adapter_limits.max_buffer_size,
         };
 
         // Compile FFT pipelines
@@ -223,6 +255,37 @@ mod wasm_global {
 
 #[cfg(target_arch = "wasm32")]
 pub use wasm_global::init_context;
+
+/// Set the download chunk size for GPU→CPU transfers on the global context.
+/// When non-zero, large buffer downloads are split into chunks of at most
+/// `bytes` (rounded down to a multiple of 8). This prevents OOM on mobile GPUs.
+/// Pass 0 to disable chunking (single-shot downloads).
+pub fn set_download_chunk_size(bytes: u64) -> anyhow::Result<()> {
+    let aligned = bytes & !7; // round down to multiple of 8 (sizeof u64)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut guard = native_global::WEBGPU_CONTEXT.lock();
+        let ctx = guard.as_mut().ok_or_else(|| anyhow!("WebGPU context not initialized"))?;
+        ctx.download_chunk_size = aligned;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        wasm_global::WEBGPU_CONTEXT.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let ctx = borrow.as_mut().ok_or_else(|| anyhow!("WebGPU context not initialized (call init_context first)"))?;
+            ctx.download_chunk_size = aligned;
+            Ok::<(), anyhow::Error>(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Configure the global context for mobile / memory-constrained GPUs.
+/// Sets the download chunk size to [`MOBILE_DOWNLOAD_CHUNK_SIZE`] (16 MiB).
+/// Must be called after context initialization.
+pub fn configure_for_mobile() -> anyhow::Result<()> {
+    set_download_chunk_size(MOBILE_DOWNLOAD_CHUNK_SIZE)
+}
 
 /// Unified context accessor. Calls `f` with a reference to the WebGpuContext.
 /// Works on both native (via parking_lot MutexGuard) and WASM (via thread_local RefCell).

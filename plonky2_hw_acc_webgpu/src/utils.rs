@@ -1,3 +1,4 @@
+use crate::context::WebGpuContext;
 use plonky2::field::goldilocks_field::GoldilocksField;
 use wgpu;
 
@@ -90,17 +91,29 @@ pub fn upload_u64_data(device: &wgpu::Device, data: &[u64], label: &str) -> wgpu
 /// Download data from a GPU buffer into a Vec<GoldilocksField>.
 /// This is a blocking operation that maps the buffer, reads, and unmaps.
 ///
+/// When `ctx.download_chunk_size` is non-zero and the total download exceeds
+/// that size, the transfer is split into multiple map/read cycles using a
+/// single reusable staging buffer. This reduces peak GPU memory and prevents
+/// `BufferAsyncError` / device loss on memory-constrained GPUs (e.g. mobile).
+///
 /// On native: uses std::sync::mpsc channel + device.poll(Wait).
 /// On WASM without async_prover: wgpu's WebGPU backend processes the callback
 /// synchronously within poll(Wait) via the microtask queue.
 #[cfg(not(feature = "async_prover"))]
 pub fn download_field_data(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    ctx: &WebGpuContext,
     src_buffer: &wgpu::Buffer,
     num_elements: usize,
 ) -> Vec<GoldilocksField> {
+    let device = &ctx.device;
+    let queue = &ctx.queue;
     let size_bytes = (num_elements * std::mem::size_of::<GoldilocksField>()) as u64;
+    let chunk_size = ctx.download_chunk_size;
+
+    // Use chunked path when configured and download is larger than one chunk.
+    if chunk_size > 0 && size_bytes > chunk_size {
+        return download_field_data_chunked_sync(device, queue, src_buffer, num_elements, chunk_size);
+    }
 
     let staging = create_staging_buffer_read(device, size_bytes, "download_staging");
 
@@ -123,9 +136,6 @@ pub fn download_field_data(
     assert!(done.load(Ordering::SeqCst), "Buffer mapping did not complete");
 
     let data = buffer_slice.get_mapped_range();
-    // Directly construct the Vec from the mapped bytes without an intermediate
-    // slice-to-vec copy. The mapped range is only valid until we drop `data`,
-    // so we copy once into a pre-allocated Vec.
     let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -143,21 +153,97 @@ pub fn download_field_data(
     result
 }
 
+/// Chunked synchronous download: copies `src_buffer` to CPU in fixed-size
+/// chunks, reusing a single staging buffer to minimise peak GPU memory.
+#[cfg(not(feature = "async_prover"))]
+fn download_field_data_chunked_sync(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src_buffer: &wgpu::Buffer,
+    num_elements: usize,
+    chunk_bytes: u64,
+) -> Vec<GoldilocksField> {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    let chunk_elems = (chunk_bytes as usize) / std::mem::size_of::<GoldilocksField>();
+    let staging = create_staging_buffer_read(device, chunk_bytes, "download_staging_chunked");
+    let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
+
+    let mut offset = 0usize;
+    while offset < num_elements {
+        let count = (num_elements - offset).min(chunk_elems);
+        let byte_count = (count * std::mem::size_of::<GoldilocksField>()) as u64;
+        let byte_offset = (offset * std::mem::size_of::<GoldilocksField>()) as u64;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("download_chunk_encoder"),
+        });
+        encoder.copy_buffer_to_buffer(src_buffer, byte_offset, &staging, 0, byte_count);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..byte_count);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_clone = done.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            r.unwrap();
+            done_clone.store(true, Ordering::SeqCst);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        assert!(done.load(Ordering::SeqCst), "Chunk buffer mapping did not complete");
+
+        let data = slice.get_mapped_range();
+        unsafe {
+            let src_ptr = data.as_ptr() as *const GoldilocksField;
+            let old_len = result.len();
+            result.set_len(old_len + count);
+            std::ptr::copy_nonoverlapping(src_ptr, result.as_mut_ptr().add(old_len), count);
+        }
+        drop(data);
+        staging.unmap();
+
+        offset += count;
+    }
+
+    staging.destroy();
+    result
+}
+
 /// Async version of download_field_data for WASM.
 /// Uses manual staging buffer with explicit destroy() to free GPU memory
 /// immediately after reading. This is critical on memory-constrained devices
 /// (e.g. iPhone Safari) where DownloadBuffer's deferred cleanup can cause
 /// BufferAsyncError from accumulated memory pressure.
+///
+/// When `ctx.download_chunk_size` is non-zero and the total download exceeds
+/// that size, the transfer is split into multiple map/read cycles using a
+/// single reusable staging buffer of `download_chunk_size` bytes. Each chunk
+/// cycle yields to the browser event loop, giving the GPU time to reclaim
+/// memory between chunks.
+///
 /// On WASM, .await yields to the browser event loop so the GPU mapAsync
 /// completion can fire.
 #[cfg(feature = "async_prover")]
 pub async fn download_field_data(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    ctx: &WebGpuContext,
     src_buffer: &wgpu::Buffer,
     num_elements: usize,
 ) -> Vec<GoldilocksField> {
+    let device = &ctx.device;
+    let queue = &ctx.queue;
     let size_bytes = (num_elements * std::mem::size_of::<GoldilocksField>()) as u64;
+    let chunk_size = ctx.download_chunk_size;
+
+    // Use chunked path when configured and download is larger than one chunk.
+    if chunk_size > 0 && size_bytes > chunk_size {
+        let num_chunks = (size_bytes + chunk_size - 1) / chunk_size;
+        log_gpu(&format!(
+            "  [gpu] download: {} elems ({} bytes) [{} chunks × {} bytes]",
+            num_elements, size_bytes, num_chunks, chunk_size,
+        ));
+        let result = download_field_data_chunked_async(device, queue, src_buffer, num_elements, chunk_size).await;
+        log_gpu("  [gpu] download: complete");
+        return result;
+    }
 
     log_gpu(&format!("  [gpu] download: {} elems ({} bytes)", num_elements, size_bytes));
 
@@ -170,23 +256,14 @@ pub async fn download_field_data(
     encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size_bytes);
     queue.submit(Some(encoder.finish()));
 
-    // Map the staging buffer for reading via oneshot channel.
-    let buffer_slice = staging.slice(..);
-    let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
-    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-
-    // On WASM this is a no-op; on native it drives completion.
-    device.poll(wgpu::Maintain::Wait);
-
-    // Await the mapping — yields to browser event loop on WASM.
-    rx.await
-        .expect("GPU download channel cancelled")
-        .expect("GPU buffer map failed (BufferAsyncError). Device may be lost due to memory pressure.");
+    // Map the staging buffer for reading, with retry on transient OOM.
+    // On iOS Safari, mapAsync can fail with BufferAsyncError when the GPU
+    // process is under memory pressure. Retrying after a brief delay gives
+    // the driver time to reclaim memory from recently destroyed buffers.
+    map_staging_with_retry(device, &staging, size_bytes).await;
 
     // Read the mapped data.
-    let data = buffer_slice.get_mapped_range();
+    let data = staging.slice(..).get_mapped_range();
     let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -206,6 +283,138 @@ pub async fn download_field_data(
     log_gpu("  [gpu] download: complete");
 
     result
+}
+
+/// Chunked async download: copies `src_buffer` to CPU in fixed-size chunks,
+/// reusing a single staging buffer to minimise peak GPU memory. Each chunk
+/// awaits the map operation, yielding to the browser event loop and giving
+/// the GPU driver time to reclaim memory between iterations.
+#[cfg(feature = "async_prover")]
+async fn download_field_data_chunked_async(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    src_buffer: &wgpu::Buffer,
+    num_elements: usize,
+    chunk_bytes: u64,
+) -> Vec<GoldilocksField> {
+    let chunk_elems = (chunk_bytes as usize) / std::mem::size_of::<GoldilocksField>();
+    let staging = create_staging_buffer_read(device, chunk_bytes, "download_staging_chunked");
+    let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
+
+    let mut offset = 0usize;
+    while offset < num_elements {
+        let count = (num_elements - offset).min(chunk_elems);
+        let byte_count = (count * std::mem::size_of::<GoldilocksField>()) as u64;
+        let byte_offset = (offset * std::mem::size_of::<GoldilocksField>()) as u64;
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("download_chunk_encoder"),
+        });
+        encoder.copy_buffer_to_buffer(src_buffer, byte_offset, &staging, 0, byte_count);
+        queue.submit(Some(encoder.finish()));
+
+        map_staging_with_retry(device, &staging, byte_count).await;
+
+        let data = staging.slice(..byte_count).get_mapped_range();
+        unsafe {
+            let src_ptr = data.as_ptr() as *const GoldilocksField;
+            let old_len = result.len();
+            result.set_len(old_len + count);
+            std::ptr::copy_nonoverlapping(src_ptr, result.as_mut_ptr().add(old_len), count);
+        }
+        drop(data);
+        staging.unmap();
+
+        offset += count;
+    }
+
+    staging.destroy();
+    result
+}
+
+/// Maximum number of mapAsync retries on BufferAsyncError before giving up.
+#[cfg(feature = "async_prover")]
+const MAP_ASYNC_MAX_RETRIES: u32 = 3;
+
+/// Base delay in ms between mapAsync retries (doubles each attempt).
+#[cfg(feature = "async_prover")]
+const MAP_ASYNC_RETRY_BASE_MS: u32 = 100;
+
+/// Map a staging buffer for reading, retrying on transient `BufferAsyncError`.
+///
+/// On iOS Safari, `mapAsync` can fail when the GPU process is under memory
+/// pressure. A brief delay between retries allows Safari's GPU process to
+/// reclaim memory from recently destroyed buffers. Each `.await` also yields
+/// to the browser event loop, which helps process pending GPU work.
+#[cfg(feature = "async_prover")]
+async fn map_staging_with_retry(
+    device: &wgpu::Device,
+    staging: &wgpu::Buffer,
+    byte_count: u64,
+) {
+    for attempt in 0..=MAP_ASYNC_MAX_RETRIES {
+        if attempt > 0 {
+            let delay = MAP_ASYNC_RETRY_BASE_MS << (attempt - 1);
+            log_gpu(&format!(
+                "  [gpu] mapAsync retry {}/{} after {}ms",
+                attempt, MAP_ASYNC_MAX_RETRIES, delay,
+            ));
+            gpu_sleep_ms(delay).await;
+        }
+
+        let slice = staging.slice(..byte_count);
+        let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+
+        // On WASM this is a no-op; on native it drives completion.
+        device.poll(wgpu::Maintain::Wait);
+
+        match rx.await {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) if attempt < MAP_ASYNC_MAX_RETRIES => {
+                log_gpu(&format!("  [gpu] mapAsync failed: {:?}", e));
+                // Buffer returns to unmapped state after failure; safe to retry.
+            }
+            Ok(Err(e)) => {
+                panic!(
+                    "GPU buffer map failed after {} retries (BufferAsyncError: {:?}). \
+                     Device may be lost due to memory pressure.",
+                    MAP_ASYNC_MAX_RETRIES, e,
+                );
+            }
+            Err(_) => panic!("GPU download channel cancelled"),
+        }
+    }
+}
+
+/// Async sleep that works in both browser main thread and Web Worker contexts.
+/// On WASM, uses `globalThis.setTimeout` via `js_sys`. On native, blocks the
+/// current thread (acceptable since the async executor is `pollster::block_on`).
+#[cfg(feature = "async_prover")]
+async fn gpu_sleep_ms(ms: u32) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let global = js_sys::global();
+            if let Ok(set_timeout) = js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("setTimeout")) {
+                if let Ok(func) = set_timeout.dyn_into::<js_sys::Function>() {
+                    let _ = func.call2(
+                        &wasm_bindgen::JsValue::undefined(),
+                        &resolve,
+                        &wasm_bindgen::JsValue::from(ms),
+                    );
+                }
+            }
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
 }
 
 /// Convert a GoldilocksField element to Montgomery form.
