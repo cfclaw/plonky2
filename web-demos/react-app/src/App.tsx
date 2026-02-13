@@ -62,6 +62,18 @@ function totalMs(
   return (initResult?.total_ms ?? 0) + (proofResult?.total_ms ?? 0);
 }
 
+/** Detect iOS/iPadOS via user-agent heuristics. */
+function detectMobilePlatform(): boolean {
+  const ua = navigator.userAgent || '';
+  // iPhone, iPad (old UA), iPod
+  if (/iPhone|iPad|iPod/.test(ua)) return true;
+  // iPadOS 13+ reports as Mac but with touch support
+  if (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) return true;
+  // Android mobile
+  if (/Android/.test(ua) && /Mobile/.test(ua)) return true;
+  return false;
+}
+
 export default function App() {
   const [cpuState, setCpuState] = useState<RunState>('idle');
   const [gpuState, setGpuState] = useState<RunState>('idle');
@@ -72,6 +84,7 @@ export default function App() {
   const [cpuStatus, setCpuStatus] = useState('');
   const [gpuStatus, setGpuStatus] = useState('');
   const [hasWebGPU, setHasWebGPU] = useState<boolean | null>(null);
+  const [mobileMode, setMobileMode] = useState<boolean>(detectMobilePlatform);
 
   const cpuWorkerRef = useRef<Worker | null>(null);
   const gpuWorkerRef = useRef<Worker | null>(null);
@@ -187,8 +200,8 @@ export default function App() {
     setGpuInitResult(null);
     setGpuProofResult(null);
     setGpuStatus('Starting...');
-    getOrCreateGpuWorker().postMessage({ type: 'run' });
-  }, [getOrCreateGpuWorker]);
+    getOrCreateGpuWorker().postMessage({ type: 'run', mobile: mobileMode });
+  }, [getOrCreateGpuWorker, mobileMode]);
 
   const rerunGpuProofs = useCallback(() => {
     setGpuState('running');
@@ -215,7 +228,7 @@ export default function App() {
         Circuit: DummyPsyTypeCCircuit + DummyPsyTypeCRecursiveVerifierCircuit (psy_bench_recursion)
       </p>
 
-      <div style={{ marginBottom: 16 }}>
+      <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <span style={{
           display: 'inline-block',
           padding: '2px 8px',
@@ -223,10 +236,21 @@ export default function App() {
           fontSize: 12,
           background: hasWebGPU === null ? '#888' : hasWebGPU ? '#2a7' : '#c44',
           color: '#fff',
-          marginRight: 8,
         }}>
           WebGPU: {hasWebGPU === null ? 'checking...' : hasWebGPU ? 'supported' : 'not available'}
         </span>
+        <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            checked={mobileMode}
+            onChange={(e) => setMobileMode(e.target.checked)}
+            disabled={gpuState === 'running'}
+          />
+          Mobile / Low Memory Mode
+          <span style={{ color: '#999' }}>
+            (chunked GPU downloads, auto-detected: {detectMobilePlatform() ? 'yes' : 'no'})
+          </span>
+        </label>
       </div>
 
       <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
@@ -389,7 +413,9 @@ export default function App() {
           <li>WebGPU acceleration applies to proving (FFT, Merkle tree construction)</li>
           <li>Verification is always CPU (no GPU needed for verification)</li>
           <li>After initial run, use "Re-run Proofs" to re-prove with cached circuits</li>
-          <li>WebGPU requires Chrome 113+ or Edge 113+ with WebGPU enabled</li>
+          <li>WebGPU requires Chrome 113+, Edge 113+, or Safari 26+ (iOS/macOS)</li>
+          <li>Mobile mode enables chunked GPU downloads (16 MiB) to prevent OOM on iOS Safari.
+              Auto-enabled when the adapter reports max_buffer_size &le; 256 MiB</li>
         </ul>
       </div>
     </div>

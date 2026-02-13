@@ -57,6 +57,40 @@ pub async fn init_gpu() -> Result<(), JsValue> {
         .map_err(|e| JsValue::from_str(&format!("GPU init failed: {}", e)))
 }
 
+/// Configure GPU for mobile / memory-constrained devices.
+/// Enables chunked GPU→CPU downloads (16 MiB chunks) to prevent
+/// BufferAsyncError / device loss from OOM on iOS Safari.
+/// Must be called after `init_gpu()`. Note: if the adapter reports
+/// max_buffer_size ≤ 256 MiB, mobile mode is enabled automatically.
+#[wasm_bindgen]
+pub fn configure_gpu_for_mobile() -> Result<(), JsValue> {
+    plonky2_hw_acc_webgpu::context::configure_for_mobile()
+        .map_err(|e| JsValue::from_str(&format!("configure_for_mobile failed: {}", e)))
+}
+
+/// Set the GPU download chunk size in bytes. When non-zero, large buffer
+/// downloads are split into chunks of at most this size. Pass 0 to disable.
+#[wasm_bindgen]
+pub fn set_gpu_download_chunk_size(bytes: u32) -> Result<(), JsValue> {
+    plonky2_hw_acc_webgpu::context::set_download_chunk_size(bytes as u64)
+        .map_err(|e| JsValue::from_str(&format!("set_download_chunk_size failed: {}", e)))
+}
+
+/// Returns the GPU adapter's max_buffer_size in bytes. Useful for diagnostics.
+/// Returns 0 if the context is not initialized.
+#[wasm_bindgen]
+pub fn get_gpu_max_buffer_size() -> u64 {
+    plonky2_hw_acc_webgpu::context::with_gpu_context(|ctx| ctx.max_buffer_size)
+        .unwrap_or(0)
+}
+
+/// Returns the current download chunk size in bytes (0 = unlimited).
+#[wasm_bindgen]
+pub fn get_gpu_download_chunk_size() -> u64 {
+    plonky2_hw_acc_webgpu::context::with_gpu_context(|ctx| ctx.download_chunk_size)
+        .unwrap_or(0)
+}
+
 #[derive(Serialize)]
 pub struct BenchmarkResult {
     pub circuit_build_ms: f64,

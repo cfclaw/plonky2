@@ -256,23 +256,14 @@ pub async fn download_field_data(
     encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size_bytes);
     queue.submit(Some(encoder.finish()));
 
-    // Map the staging buffer for reading via oneshot channel.
-    let buffer_slice = staging.slice(..);
-    let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
-    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-
-    // On WASM this is a no-op; on native it drives completion.
-    device.poll(wgpu::Maintain::Wait);
-
-    // Await the mapping — yields to browser event loop on WASM.
-    rx.await
-        .expect("GPU download channel cancelled")
-        .expect("GPU buffer map failed (BufferAsyncError). Device may be lost due to memory pressure.");
+    // Map the staging buffer for reading, with retry on transient OOM.
+    // On iOS Safari, mapAsync can fail with BufferAsyncError when the GPU
+    // process is under memory pressure. Retrying after a brief delay gives
+    // the driver time to reclaim memory from recently destroyed buffers.
+    map_staging_with_retry(device, &staging, size_bytes).await;
 
     // Read the mapped data.
-    let data = buffer_slice.get_mapped_range();
+    let data = staging.slice(..).get_mapped_range();
     let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -322,20 +313,9 @@ async fn download_field_data_chunked_async(
         encoder.copy_buffer_to_buffer(src_buffer, byte_offset, &staging, 0, byte_count);
         queue.submit(Some(encoder.finish()));
 
-        let slice = staging.slice(..byte_count);
-        let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
+        map_staging_with_retry(device, &staging, byte_count).await;
 
-        // On WASM this is a no-op; on native it drives completion.
-        device.poll(wgpu::Maintain::Wait);
-
-        rx.await
-            .expect("GPU download chunk channel cancelled")
-            .expect("GPU chunk buffer map failed (BufferAsyncError). Device may be lost due to memory pressure.");
-
-        let data = slice.get_mapped_range();
+        let data = staging.slice(..byte_count).get_mapped_range();
         unsafe {
             let src_ptr = data.as_ptr() as *const GoldilocksField;
             let old_len = result.len();
@@ -350,6 +330,91 @@ async fn download_field_data_chunked_async(
 
     staging.destroy();
     result
+}
+
+/// Maximum number of mapAsync retries on BufferAsyncError before giving up.
+#[cfg(feature = "async_prover")]
+const MAP_ASYNC_MAX_RETRIES: u32 = 3;
+
+/// Base delay in ms between mapAsync retries (doubles each attempt).
+#[cfg(feature = "async_prover")]
+const MAP_ASYNC_RETRY_BASE_MS: u32 = 100;
+
+/// Map a staging buffer for reading, retrying on transient `BufferAsyncError`.
+///
+/// On iOS Safari, `mapAsync` can fail when the GPU process is under memory
+/// pressure. A brief delay between retries allows Safari's GPU process to
+/// reclaim memory from recently destroyed buffers. Each `.await` also yields
+/// to the browser event loop, which helps process pending GPU work.
+#[cfg(feature = "async_prover")]
+async fn map_staging_with_retry(
+    device: &wgpu::Device,
+    staging: &wgpu::Buffer,
+    byte_count: u64,
+) {
+    for attempt in 0..=MAP_ASYNC_MAX_RETRIES {
+        if attempt > 0 {
+            let delay = MAP_ASYNC_RETRY_BASE_MS << (attempt - 1);
+            log_gpu(&format!(
+                "  [gpu] mapAsync retry {}/{} after {}ms",
+                attempt, MAP_ASYNC_MAX_RETRIES, delay,
+            ));
+            gpu_sleep_ms(delay).await;
+        }
+
+        let slice = staging.slice(..byte_count);
+        let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+
+        // On WASM this is a no-op; on native it drives completion.
+        device.poll(wgpu::Maintain::Wait);
+
+        match rx.await {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) if attempt < MAP_ASYNC_MAX_RETRIES => {
+                log_gpu(&format!("  [gpu] mapAsync failed: {:?}", e));
+                // Buffer returns to unmapped state after failure; safe to retry.
+            }
+            Ok(Err(e)) => {
+                panic!(
+                    "GPU buffer map failed after {} retries (BufferAsyncError: {:?}). \
+                     Device may be lost due to memory pressure.",
+                    MAP_ASYNC_MAX_RETRIES, e,
+                );
+            }
+            Err(_) => panic!("GPU download channel cancelled"),
+        }
+    }
+}
+
+/// Async sleep that works in both browser main thread and Web Worker contexts.
+/// On WASM, uses `globalThis.setTimeout` via `js_sys`. On native, blocks the
+/// current thread (acceptable since the async executor is `pollster::block_on`).
+#[cfg(feature = "async_prover")]
+async fn gpu_sleep_ms(ms: u32) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let global = js_sys::global();
+            if let Ok(set_timeout) = js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("setTimeout")) {
+                if let Ok(func) = set_timeout.dyn_into::<js_sys::Function>() {
+                    let _ = func.call2(
+                        &wasm_bindgen::JsValue::undefined(),
+                        &resolve,
+                        &wasm_bindgen::JsValue::from(ms),
+                    );
+                }
+            }
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    }
 }
 
 /// Convert a GoldilocksField element to Montgomery form.

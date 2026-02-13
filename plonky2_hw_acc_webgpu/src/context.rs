@@ -34,6 +34,11 @@ pub struct WebGpuContext {
     /// Set to 0 for unlimited (single-shot download, the default).
     /// Recommended: [`MOBILE_DOWNLOAD_CHUNK_SIZE`] (16 MiB) for mobile.
     pub download_chunk_size: u64,
+    /// The adapter's reported max_buffer_size, captured during initialization.
+    /// Useful for diagnostics and auto-configuration. On constrained devices
+    /// (e.g. iOS Safari reporting 256 MiB), chunked downloads are enabled
+    /// automatically.
+    pub max_buffer_size: u64,
 }
 
 impl WebGpuContext {
@@ -59,14 +64,22 @@ impl WebGpuContext {
         .await
         .ok_or_else(|| anyhow!("No suitable GPU adapter found"))?;
 
+        // Query adapter limits and clamp our requests to what the hardware
+        // actually supports. This prevents device creation failures on
+        // constrained GPUs (e.g. iOS Safari with max_buffer_size = 256 MiB).
+        let adapter_limits = adapter.limits();
+        let requested_max_buffer = (1u64 << 30).min(adapter_limits.max_buffer_size);
+        let requested_max_storage = (1u32 << 30).min(adapter_limits.max_storage_buffer_binding_size);
+        let requested_max_workgroups = 65535u32.min(adapter_limits.max_compute_workgroups_per_dimension);
+
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("plonky2_webgpu"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 1 << 30, // 1 GB
-                    max_buffer_size: 1 << 30,
-                    max_compute_workgroups_per_dimension: 65535,
+                    max_storage_buffer_binding_size: requested_max_storage,
+                    max_buffer_size: requested_max_buffer,
+                    max_compute_workgroups_per_dimension: requested_max_workgroups,
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -76,12 +89,20 @@ impl WebGpuContext {
         .await
         .map_err(|e| anyhow!("Failed to create WebGPU device: {}", e))?;
 
+        // Auto-configure chunked downloads for constrained devices.
+        // The WebGPU spec baseline maxBufferSize is 256 MiB, chosen to
+        // accommodate the lowest iOS tier (gpuweb Issue #1371). If the adapter
+        // reports ≤256 MiB, we're likely on a memory-constrained mobile device.
+        let is_constrained = adapter_limits.max_buffer_size <= 256 * 1024 * 1024;
+        let download_chunk_size = if is_constrained { MOBILE_DOWNLOAD_CHUNK_SIZE } else { 0 };
+
         let mut ctx = Self {
             device,
             queue,
             pipelines: HashMap::new(),
             twiddle_buffers: HashMap::new(),
-            download_chunk_size: 0,
+            download_chunk_size,
+            max_buffer_size: adapter_limits.max_buffer_size,
         };
 
         // Compile FFT pipelines

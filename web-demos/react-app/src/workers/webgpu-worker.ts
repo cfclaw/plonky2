@@ -1,4 +1,12 @@
-import init, { init as initPanic, init_gpu, build_circuits_webgpu, run_proofs_webgpu } from 'plonky2-wasm-webgpu';
+import init, {
+  init as initPanic,
+  init_gpu,
+  configure_gpu_for_mobile,
+  get_gpu_max_buffer_size,
+  get_gpu_download_chunk_size,
+  build_circuits_webgpu,
+  run_proofs_webgpu,
+} from 'plonky2-wasm-webgpu';
 
 let wasmInitialized = false;
 
@@ -11,6 +19,29 @@ self.onmessage = async (e: MessageEvent) => {
         initPanic();
         self.postMessage({ type: 'status', status: 'Initializing WebGPU device...' });
         await init_gpu();
+
+        // Apply mobile configuration if requested or auto-detected.
+        // The WASM layer auto-enables chunking when the adapter reports
+        // max_buffer_size ≤ 256 MiB. The explicit flag from the UI is an
+        // additional manual override for devices that report higher limits
+        // but still suffer from memory pressure (e.g. newer iPhones).
+        const mobileMode = e.data.mobile === true;
+        const maxBuf = get_gpu_max_buffer_size();
+        const autoChunk = get_gpu_download_chunk_size();
+
+        if (mobileMode && autoChunk === BigInt(0)) {
+          configure_gpu_for_mobile();
+          self.postMessage({
+            type: 'status',
+            status: `Mobile mode enabled (manual). Adapter max_buffer_size: ${maxBuf}`,
+          });
+        } else if (autoChunk > BigInt(0)) {
+          self.postMessage({
+            type: 'status',
+            status: `Mobile mode auto-enabled (chunk=${autoChunk}). Adapter max_buffer_size: ${maxBuf}`,
+          });
+        }
+
         wasmInitialized = true;
       }
 
