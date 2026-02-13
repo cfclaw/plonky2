@@ -286,10 +286,35 @@ pub fn set_download_chunk_size(bytes: u64) -> anyhow::Result<()> {
 }
 
 /// Configure the global context for mobile / memory-constrained GPUs.
-/// Sets the download chunk size to [`MOBILE_DOWNLOAD_CHUNK_SIZE`] (16 MiB).
+/// Sets the download chunk size to [`MOBILE_DOWNLOAD_CHUNK_SIZE`] (4 MiB).
 /// Must be called after context initialization.
 pub fn configure_for_mobile() -> anyhow::Result<()> {
     set_download_chunk_size(MOBILE_DOWNLOAD_CHUNK_SIZE)
+}
+
+/// Register a JS function to be called at GPU phase boundaries.
+///
+/// The prover calls this function after destroying large GPU buffers and before
+/// allocating new ones. The function **must return a `Promise`**; the prover
+/// `await`s it, giving the browser event loop a turn to reclaim destroyed GPU
+/// memory. This replaces the built-in `setTimeout(0)` fallback with JS-driven
+/// yield control.
+///
+/// ```js
+/// // Minimal: yield one event-loop turn
+/// wasm.set_gpu_yield_callback(() => new Promise(r => setTimeout(r, 0)));
+///
+/// // With progress reporting to UI:
+/// wasm.set_gpu_yield_callback(() => {
+///   postMessage({ type: 'gpu_phase_done' });
+///   return new Promise(r => setTimeout(r, 0));
+/// });
+/// ```
+///
+/// Pass `None` to clear the callback and revert to the built-in fallback.
+#[cfg(target_arch = "wasm32")]
+pub fn set_gpu_yield_callback(f: Option<js_sys::Function>) {
+    crate::utils::set_gpu_yield_callback(f);
 }
 
 /// Unified context accessor. Calls `f` with a reference to the WebGpuContext.

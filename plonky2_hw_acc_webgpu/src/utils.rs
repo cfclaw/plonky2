@@ -438,20 +438,90 @@ async fn gpu_sleep_ms(ms: u32) {
     }
 }
 
-/// Flush GPU memory by polling the device to completion and yielding to the
-/// browser event loop. On iOS Safari, `buffer.destroy()` marks the buffer for
-/// deallocation, but the GPU process doesn't actually reclaim the memory until
-/// the event loop runs. This function ensures destroyed buffers are truly freed
-/// before we allocate new ones, preventing cumulative memory pressure across
-/// multiple proof phases.
+// ---------------------------------------------------------------------------
+// GPU yield callback: lets JS drive phase transitions instead of setTimeout
+// ---------------------------------------------------------------------------
+
+/// On WASM, stores a JS function that the prover calls at each GPU phase
+/// boundary. The function must return a Promise; awaiting it gives the browser
+/// event loop a turn to reclaim destroyed GPU buffers. If no callback is set,
+/// falls back to `setTimeout(0)`.
+#[cfg(target_arch = "wasm32")]
+mod yield_cb {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static YIELD_FN: RefCell<Option<js_sys::Function>> = RefCell::new(None);
+    }
+
+    pub fn set(f: Option<js_sys::Function>) {
+        YIELD_FN.with(|cell| *cell.borrow_mut() = f);
+    }
+
+    /// Call the JS yield callback. Returns `true` if a callback was set and
+    /// invoked, `false` if no callback is registered.
+    pub async fn invoke() -> bool {
+        let promise = YIELD_FN.with(|cell| {
+            cell.borrow().as_ref().map(|f| {
+                let result = f
+                    .call0(&wasm_bindgen::JsValue::undefined())
+                    .unwrap_or(wasm_bindgen::JsValue::undefined());
+                js_sys::Promise::from(result)
+            })
+        });
+        if let Some(p) = promise {
+            let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Register a JS function to be called at GPU phase boundaries.
+///
+/// The function receives no arguments and **must return a `Promise`**. The
+/// prover `await`s the promise before continuing, giving the browser event
+/// loop a turn to reclaim destroyed GPU buffers.
+///
+/// ```js
+/// // Simple: just yield one event-loop turn
+/// wasm.set_gpu_yield_callback(() => new Promise(r => setTimeout(r, 0)));
+///
+/// // With progress reporting:
+/// wasm.set_gpu_yield_callback(() => {
+///   postMessage({ type: 'gpu_phase_done' });
+///   return new Promise(r => setTimeout(r, 0));
+/// });
+/// ```
+///
+/// Pass `null` / call with no arguments to clear the callback and revert to
+/// the built-in `setTimeout(0)` fallback.
+#[cfg(target_arch = "wasm32")]
+pub fn set_gpu_yield_callback(f: Option<js_sys::Function>) {
+    yield_cb::set(f);
+}
+
+/// Flush GPU memory by polling the device and yielding to the caller.
+///
+/// On WASM (async_prover): polls the device, then invokes the JS yield
+/// callback if one was registered via [`set_gpu_yield_callback`]. If no
+/// callback is set, falls back to `setTimeout(0)` for one event-loop turn.
+///
+/// On native: just polls the device to completion (no yield needed).
 ///
 /// Call this after destroying large GPU buffers and before allocating new ones.
 #[cfg(feature = "async_prover")]
 pub async fn flush_gpu_memory(device: &wgpu::Device) {
     device.poll(wgpu::Maintain::Wait);
-    // Yield to the event loop so the GPU process can reclaim destroyed buffers.
-    // A 0ms setTimeout is sufficient — it just needs one event loop turn.
-    gpu_sleep_ms(0).await;
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Prefer the JS yield callback (gives JS full control over timing),
+        // fall back to setTimeout(0) if none is registered.
+        if !yield_cb::invoke().await {
+            gpu_sleep_ms(0).await;
+        }
+    }
 }
 
 /// Synchronous version of flush_gpu_memory for non-async targets.

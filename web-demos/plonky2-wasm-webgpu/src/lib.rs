@@ -58,7 +58,7 @@ pub async fn init_gpu() -> Result<(), JsValue> {
 }
 
 /// Configure GPU for mobile / memory-constrained devices.
-/// Enables chunked GPU→CPU downloads (16 MiB chunks) to prevent
+/// Enables chunked GPU→CPU downloads (4 MiB chunks) to prevent
 /// BufferAsyncError / device loss from OOM on iOS Safari.
 /// Must be called after `init_gpu()`. Note: if the adapter reports
 /// max_buffer_size ≤ 256 MiB, mobile mode is enabled automatically.
@@ -66,6 +66,37 @@ pub async fn init_gpu() -> Result<(), JsValue> {
 pub fn configure_gpu_for_mobile() -> Result<(), JsValue> {
     plonky2_hw_acc_webgpu::context::configure_for_mobile()
         .map_err(|e| JsValue::from_str(&format!("configure_for_mobile failed: {}", e)))
+}
+
+/// Register a JS callback for GPU phase boundary yields.
+///
+/// The prover calls this function between GPU phases (after destroying buffers,
+/// before allocating new ones). The callback **must return a Promise** — the
+/// prover awaits it, giving the browser event loop a turn to reclaim destroyed
+/// GPU memory.
+///
+/// This replaces the built-in `setTimeout(0)` fallback with JS-controlled
+/// yield behavior, enabling progress reporting and explicit scheduling.
+///
+/// ```js
+/// // Simple: yield one event-loop turn between GPU phases
+/// wasm.set_gpu_yield_callback(() => new Promise(r => setTimeout(r, 0)));
+///
+/// // With progress reporting:
+/// wasm.set_gpu_yield_callback(() => {
+///   postMessage({ type: 'gpu_phase_done' });
+///   return new Promise(r => setTimeout(r, 0));
+/// });
+/// ```
+#[wasm_bindgen]
+pub fn set_gpu_yield_callback(f: js_sys::Function) {
+    plonky2_hw_acc_webgpu::context::set_gpu_yield_callback(Some(f));
+}
+
+/// Clear the GPU yield callback, reverting to the built-in setTimeout(0) fallback.
+#[wasm_bindgen]
+pub fn clear_gpu_yield_callback() {
+    plonky2_hw_acc_webgpu::context::set_gpu_yield_callback(None);
 }
 
 /// Set the GPU download chunk size in bytes. When non-zero, large buffer
