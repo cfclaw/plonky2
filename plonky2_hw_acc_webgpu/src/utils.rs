@@ -276,9 +276,14 @@ pub async fn download_field_data(
 }
 
 /// Chunked async download: copies `src_buffer` to CPU in fixed-size chunks,
-/// reusing a single staging buffer to minimise peak GPU memory. Each chunk
-/// awaits the map operation, yielding to the browser event loop and giving
-/// the GPU driver time to reclaim memory between iterations.
+/// reusing a **single** staging buffer to minimise peak GPU memory. Each
+/// chunk awaits the map operation, yielding to the browser event loop and
+/// giving the GPU driver time to reclaim memory between iterations.
+///
+/// Using one staging buffer is critical on iOS Safari: creating N staging
+/// buffers and destroying them produces N pending destructions that the GPU
+/// process may not reclaim before the next pipeline phase allocates buffers,
+/// causing cumulative memory pressure and device loss.
 #[cfg(feature = "async_prover")]
 async fn download_field_data_chunked_async(
     device: &wgpu::Device,
@@ -290,18 +295,65 @@ async fn download_field_data_chunked_async(
     let chunk_elems = (chunk_bytes as usize) / std::mem::size_of::<GoldilocksField>();
     let mut result = Vec::<GoldilocksField>::with_capacity(num_elements);
 
+    // Create one staging buffer, reused for every chunk.
+    let staging = create_staging_buffer_read(device, chunk_bytes, "download_chunk_staging");
+
     let mut offset = 0usize;
     while offset < num_elements {
         let count = (num_elements - offset).min(chunk_elems);
         let byte_count = (count * std::mem::size_of::<GoldilocksField>()) as u64;
         let byte_offset = (offset * std::mem::size_of::<GoldilocksField>()) as u64;
 
-        // Copy chunk → staging and map, with retry (destroy + recreate) on OOM.
-        let staging = copy_and_map_with_retry(
-            device, queue, src_buffer, byte_offset, byte_count, "download_chunk_staging",
-        ).await;
+        // Copy this chunk from the source buffer into the staging buffer.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("download_chunk_encoder"),
+        });
+        encoder.copy_buffer_to_buffer(src_buffer, byte_offset, &staging, 0, byte_count);
+        queue.submit(Some(encoder.finish()));
 
-        let data = staging.slice(..byte_count).get_mapped_range();
+        // Map the staging buffer.
+        let slice = staging.slice(..byte_count);
+        let (tx, rx) = futures_channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+
+        match rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // Staging buffer map failed. Destroy it and fall back to
+                // copy_and_map_with_retry for the remaining data.
+                staging.destroy();
+                log_gpu(&format!(
+                    "  [gpu] chunked download: mapAsync failed at offset {}, falling back to retry path: {:?}",
+                    offset, e,
+                ));
+                // Download remaining elements via the retry path (creates fresh
+                // staging buffers per attempt).
+                let remaining = num_elements - offset;
+                let remaining_bytes = (remaining * std::mem::size_of::<GoldilocksField>()) as u64;
+                let fallback_staging = copy_and_map_with_retry(
+                    device, queue, src_buffer, byte_offset, remaining_bytes,
+                    "download_chunk_fallback",
+                ).await;
+                let data = fallback_staging.slice(..remaining_bytes).get_mapped_range();
+                unsafe {
+                    let src_ptr = data.as_ptr() as *const GoldilocksField;
+                    let old_len = result.len();
+                    result.set_len(old_len + remaining);
+                    std::ptr::copy_nonoverlapping(src_ptr, result.as_mut_ptr().add(old_len), remaining);
+                }
+                drop(data);
+                fallback_staging.unmap();
+                fallback_staging.destroy();
+                return result;
+            }
+            Err(_) => panic!("GPU download channel cancelled"),
+        }
+
+        // Read mapped data.
+        let data = slice.get_mapped_range();
         unsafe {
             let src_ptr = data.as_ptr() as *const GoldilocksField;
             let old_len = result.len();
@@ -310,11 +362,11 @@ async fn download_field_data_chunked_async(
         }
         drop(data);
         staging.unmap();
-        staging.destroy();
 
         offset += count;
     }
 
+    staging.destroy();
     result
 }
 

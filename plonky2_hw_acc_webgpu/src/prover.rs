@@ -997,14 +997,16 @@ macro_rules! impl_webgpu_prover_compute {
 
                             // Run merkle hash/compress directly on leaf_buffer.
                             // No separate input_buffer allocation needed (~67 MiB saved).
+                            // owns_input_buffer=true: the core function destroys
+                            // leaf_buffer right after merkle submission, BEFORE the
+                            // tree/cap downloads. This frees ~67 MiB of GPU memory
+                            // before any staging buffers are allocated for downloads.
                             let (digests, cap_hashes) = plonky2::maybe_await!(
                                 Self::build_merkle_tree_gpu_core(
                                     ctx, &leaf_buffer, lde_size, num_cols,
-                                    cap_height, false,
+                                    cap_height, true,
                                 )
                             )?;
-
-                            leaf_buffer.destroy();
 
                             let leaves: Vec<Vec<F>> = (0..lde_size)
                                 .into_par_iter()
