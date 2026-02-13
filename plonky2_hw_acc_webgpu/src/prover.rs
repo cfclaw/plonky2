@@ -682,6 +682,7 @@ mod fft {
 
                 // Free src_buffer before download — no longer referenced by download commands.
                 src_buffer.destroy();
+                plonky2::maybe_await!(super::utils::flush_gpu_memory(&ctx.device));
 
                 // Download results (already in standard form)
                 let all_data = plonky2::maybe_await!(
@@ -689,6 +690,7 @@ mod fft {
                 );
 
                 dst_buffer.destroy();
+                plonky2::maybe_await!(super::utils::flush_gpu_memory(&ctx.device));
 
                 // Split into PolynomialCoeffs (no from_mont needed)
                 let results: Vec<PolynomialCoeffs<GoldilocksField>> = (0..num_polys)
@@ -945,7 +947,8 @@ macro_rules! impl_gpu_commit_helpers {
                 })
                 .collect();
 
-            // Free Merkle GPU buffers
+            // Free Merkle GPU buffers and flush so the driver reclaims them
+            // before the caller allocates staging buffers for leaf download.
             ping_buffer.destroy();
             pong_buffer.destroy();
             tree_buffer.destroy();
@@ -1003,8 +1006,11 @@ macro_rules! impl_gpu_commit_helpers {
                 ctx.queue.submit(Some(encoder.finish()));
             }
 
-            // fft_dst no longer needed — free memory before Merkle phase
+            // fft_dst no longer needed — free memory before Merkle phase.
+            // Flush GPU to let the driver reclaim this (often large) buffer
+            // before we allocate Merkle tree buffers.
             fft_dst_buffer.destroy();
+            plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
 
             // Phase 2: Scatter salt (if blinding enabled)
             if salt_size > 0 {
@@ -1059,11 +1065,20 @@ macro_rules! impl_gpu_commit_helpers {
                 ))?
             );
 
+            // Flush GPU after Merkle tree (frees ping/pong/tree buffers)
+            // before the large leaf download.
+            plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
+
             // Phase 4: Download leaves (Merkle GPU buffers already freed, lower memory pressure)
             let all_leaf_data = plonky2::maybe_await!(
                 utils::download_field_data(ctx, &leaf_buffer, lde_size * num_cols)
             );
             leaf_buffer.destroy();
+
+            // Flush after destroying the leaf buffer — this is often the largest
+            // single allocation and we want it truly freed before the next
+            // commitment starts allocating.
+            plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
 
             // Split into per-row leaves
             let leaves: Vec<Vec<F>> = (0..lde_size)
@@ -1307,6 +1322,9 @@ macro_rules! impl_webgpu_prover_compute {
                     // longer referenced by any pending download commands. The submitted
                     // hash/compress commands keep their own internal reference.
                     input_buffer.destroy();
+                    // Flush so the driver reclaims the (large) input buffer before
+                    // we start downloading tree digests via staging buffers.
+                    plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
 
                     // Read back results
                     let tree_digests: Vec<HashOut<F>> = if num_digests > 0 {
@@ -1411,6 +1429,10 @@ macro_rules! impl_webgpu_prover_compute {
                             // Free input buffers — reduces peak memory before transpose phase
                             src_buffer.destroy();
                             shifts_buffer.destroy();
+
+                            // Flush so the GPU driver reclaims src+shifts memory
+                            // before finalize_commitment allocates leaf+Merkle buffers.
+                            plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
 
                             dst_buffer
                         };
@@ -1569,6 +1591,9 @@ macro_rules! impl_webgpu_prover_compute {
                             ctx.queue.submit(Some(encoder.finish()));
                             ifft_src.destroy();
 
+                            // Flush so the GPU driver reclaims ifft_src before download
+                            plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
+
                             ifft_dst
                         };
 
@@ -1576,6 +1601,11 @@ macro_rules! impl_webgpu_prover_compute {
                         let coeffs_data = plonky2::maybe_await!(
                             utils::download_field_data(ctx, &ifft_dst, num_polys * n)
                         );
+
+                        // Flush GPU between download and next allocation phase.
+                        // The IFFT src buffer was already destroyed; ensure the
+                        // staging buffer from download is reclaimed too.
+                        plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
 
                         // Phase 3: Coset FFT from GPU-resident IFFT buffer
                         // encode_coset_fft_from_buffer applies to_mont in-place, which is fine
@@ -1602,6 +1632,10 @@ macro_rules! impl_webgpu_prover_compute {
                             // Free IFFT buffer and shifts — no longer needed
                             ifft_dst.destroy();
                             shifts_buffer.destroy();
+
+                            // Flush so the GPU driver reclaims ifft_dst+shifts
+                            // before finalize_commitment allocates leaf+Merkle buffers.
+                            plonky2::maybe_await!(utils::flush_gpu_memory(&ctx.device));
 
                             fft_dst
                         };

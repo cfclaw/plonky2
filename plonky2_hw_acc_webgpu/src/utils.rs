@@ -319,12 +319,16 @@ async fn download_field_data_chunked_async(
 }
 
 /// Maximum number of mapAsync retries on BufferAsyncError before giving up.
+/// Increased from 3 to 6 to better handle cumulative memory pressure across
+/// multiple proof commitments on mobile devices (iOS Safari).
 #[cfg(feature = "async_prover")]
-const MAP_ASYNC_MAX_RETRIES: u32 = 3;
+const MAP_ASYNC_MAX_RETRIES: u32 = 6;
 
 /// Base delay in ms between mapAsync retries (doubles each attempt).
+/// Increased from 100ms to 200ms to give the GPU driver more time to reclaim
+/// memory. With 6 retries this gives: 200, 400, 800, 1600, 3200, 6400ms.
 #[cfg(feature = "async_prover")]
-const MAP_ASYNC_RETRY_BASE_MS: u32 = 100;
+const MAP_ASYNC_RETRY_BASE_MS: u32 = 200;
 
 /// Copy `byte_count` bytes from `src_buffer` at `src_offset` into a freshly
 /// created staging buffer, map it, and return the mapped staging buffer.
@@ -353,9 +357,12 @@ async fn copy_and_map_with_retry(
         if attempt > 0 {
             let delay = MAP_ASYNC_RETRY_BASE_MS << (attempt - 1);
             log_gpu(&format!(
-                "  [gpu] mapAsync retry {}/{} after {}ms (destroying + recreating staging buffer)",
+                "  [gpu] mapAsync retry {}/{} after {}ms (flush + recreate staging buffer)",
                 attempt, MAP_ASYNC_MAX_RETRIES, delay,
             ));
+            // Flush GPU memory first to let the driver reclaim destroyed buffers,
+            // then sleep the requested backoff period.
+            flush_gpu_memory(device).await;
             gpu_sleep_ms(delay).await;
         }
 
@@ -429,6 +436,29 @@ async fn gpu_sleep_ms(ms: u32) {
     {
         std::thread::sleep(std::time::Duration::from_millis(ms as u64));
     }
+}
+
+/// Flush GPU memory by polling the device to completion and yielding to the
+/// browser event loop. On iOS Safari, `buffer.destroy()` marks the buffer for
+/// deallocation, but the GPU process doesn't actually reclaim the memory until
+/// the event loop runs. This function ensures destroyed buffers are truly freed
+/// before we allocate new ones, preventing cumulative memory pressure across
+/// multiple proof phases.
+///
+/// Call this after destroying large GPU buffers and before allocating new ones.
+#[cfg(feature = "async_prover")]
+pub async fn flush_gpu_memory(device: &wgpu::Device) {
+    device.poll(wgpu::Maintain::Wait);
+    // Yield to the event loop so the GPU process can reclaim destroyed buffers.
+    // A 0ms setTimeout is sufficient — it just needs one event loop turn.
+    gpu_sleep_ms(0).await;
+}
+
+/// Synchronous version of flush_gpu_memory for non-async targets.
+/// Just polls the device to completion; no event loop yield is needed on native.
+#[cfg(not(feature = "async_prover"))]
+pub fn flush_gpu_memory(device: &wgpu::Device) {
+    device.poll(wgpu::Maintain::Wait);
 }
 
 /// Convert a GoldilocksField element to Montgomery form.

@@ -19,8 +19,11 @@ const MERKLE_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/merkle.wgsl"))
 const MAX_DEGREE_LOG: usize = 18;
 const MAX_RATE_BITS: usize = 4;
 
-/// Default download chunk size for mobile/memory-constrained GPUs: 16 MiB.
-pub const MOBILE_DOWNLOAD_CHUNK_SIZE: u64 = 16 * 1024 * 1024;
+/// Default download chunk size for mobile/memory-constrained GPUs: 4 MiB.
+/// Reduced from 16 MiB to lower peak staging buffer allocation. On iOS Safari,
+/// each staging buffer contributes to cumulative GPU memory pressure even after
+/// destroy(). Smaller chunks reduce the high-water mark per download cycle.
+pub const MOBILE_DOWNLOAD_CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 
 pub struct WebGpuContext {
     pub device: wgpu::Device,
